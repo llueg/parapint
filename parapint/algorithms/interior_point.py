@@ -83,7 +83,7 @@ class LinalgOptions(ConfigDict):
         self.declare('reallocation_factor', ConfigValue(domain=PositiveFloat))
         self.declare('max_num_reallocations', ConfigValue(domain=NonNegativeInt))
 
-        self.solver = None
+        self.solver: LinearSolverInterface = None
         self.reallocation_factor = 2
         self.max_num_reallocations = 5
 
@@ -563,7 +563,7 @@ def ip_solve(interface: BaseInteriorPointInterface,
         timer.stop('factorize')
 
         timer.start('back solve')
-        delta = options.linalg.solver.do_back_solve(rhs)
+        delta = options.linalg.solver.do_back_solve(rhs, timer, barrier_parameter)
         timer.stop('back solve')
 
         interface.set_primal_dual_kkt_solution(delta)

@@ -100,7 +100,7 @@ class Problem(parapint.interfaces.MPIStochasticSchurComplementInteriorPointInter
 
 def main(farmer: Farmer, subproblem_solver_class, subproblem_solver_options):
     interface = Problem(farmer=farmer)
-    linear_solver = parapint.linalg.MPISchurComplementLinearSolver(
+    linear_solver = parapint.linalg.MPIImplicitSchurComplementLinearSolver(
         subproblem_solvers={ndx: subproblem_solver_class(**subproblem_solver_options) for ndx in range(len(farmer.scenarios))},
         schur_complement_solver=subproblem_solver_class(**subproblem_solver_options))
     options = parapint.algorithms.IPOptions()

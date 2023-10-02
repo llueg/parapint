@@ -4,128 +4,22 @@ from parapint.linalg.base_linear_solver_interface import LinearSolverInterface
 from parapint.linalg.results import LinearSolverStatus, LinearSolverResults
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse.linalg import cg, LinearOperator
 from mpi4py import MPI
 import itertools
 from .explicit_schur_complement import _process_sub_results
 from typing import Dict, Optional, List
 from pyomo.common.timing import HierarchicalTimer
 
+from .mpi_explicit_schur_complement import _gather_results, _BorderMatrix, _get_all_nonzero_elements_in_sc, \
+      _get_all_nonzero_elements_in_sc, _process_sub_results
 
 comm: MPI.Comm = MPI.COMM_WORLD
 rank: int = comm.Get_rank()
 size: int = comm.Get_size()
 
 
-def _gather_results(res: LinearSolverResults) -> LinearSolverResults:
-    stat = res.status.value
-    stats = comm.allgather(stat)
-    sub_res = LinearSolverResults()
-    res = LinearSolverResults()
-    res.status = LinearSolverStatus.successful
-    for stat in stats:
-        sub_res.status = LinearSolverStatus(stat)
-        _process_sub_results(res, sub_res)
-        if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
-            break
-    return res
-
-
-class _BorderMatrix(object):
-    def __init__(self, matrix):
-        self.csr: csr_matrix = matrix.tocsr()
-        self.nonzero_rows: np.ndarray = self._get_nonzero_rows()
-
-        # maps row index to index in self.nonzero_rows
-        self.nonzero_row_to_ndx_map: dict = self._get_nonzero_row_to_ndx_map()
-
-        self.sc_data_offset: Optional[int] = None
-
-    def _get_nonzero_rows(self):
-        _tmp = np.empty(self.csr.indptr.size, dtype=np.int64)
-        _tmp[0:-1] = self.csr.indptr[1:]
-        _tmp[-1] = self.csr.indptr[-1]
-        nonzero_rows = (_tmp - self.csr.indptr).nonzero()[0]
-        return nonzero_rows
-
-    def _get_nonzero_row_to_ndx_map(self):
-        res = dict()
-        for i, _row in enumerate(self.nonzero_rows):
-            res[_row] = i
-        return res
-
-    @property
-    def num_nonzero_rows(self):
-        return self.nonzero_rows.size
-
-
-def _get_nested_comms() -> List[MPI.Comm]:
-    nested_comms = list()  # root first, leaf last
-    nested_comms.append(comm)
-
-    last_comm = comm
-    while last_comm.Get_size() > 3:
-        if last_comm.Get_rank() < last_comm.Get_size()/2:
-            color = 0
-        else:
-            color = 1
-        last_comm = last_comm.Split(color, last_comm.Get_rank())
-        nested_comms.append(last_comm)
-
-    return nested_comms
-
-
-def _combine_nonzero_elements(rows, cols):
-    nonzero_elements = list(zip(rows, cols))
-    nonzero_elements = {i: None for i in nonzero_elements}
-    nonzero_elements = list(nonzero_elements.keys())
-    nonzero_elements.sort()
-    nonzero_rows, nonzero_cols = tuple(zip(*nonzero_elements))
-    nonzero_rows = np.asarray(nonzero_rows, dtype=np.int64)
-    nonzero_cols = np.asarray(nonzero_cols, dtype=np.int64)
-    return nonzero_rows, nonzero_cols
-
-
-def _get_all_nonzero_elements_in_sc(border_matrices: Dict[int, _BorderMatrix]):
-    nested_comms = _get_nested_comms()
-
-    nonzero_rows = np.zeros(0, dtype=np.int64)
-    nonzero_cols = np.zeros(0, dtype=np.int64)
-
-    for ndx, mat in border_matrices.items():
-        mat_nz_elements = list(itertools.product(mat.nonzero_rows, mat.nonzero_rows))
-        mat_nz_rows, mat_nz_cols = tuple(zip(*mat_nz_elements))
-        nonzero_rows = np.concatenate([nonzero_rows, mat_nz_rows])
-        nonzero_cols = np.concatenate([nonzero_cols, mat_nz_cols])
-        nonzero_rows, nonzero_cols = _combine_nonzero_elements(nonzero_rows, nonzero_cols)
-
-    for _comm in reversed(nested_comms):
-        tmp_nz_rows_size = np.zeros(_comm.Get_size(), dtype=np.int64)
-        tmp_nz_cols_size = np.zeros(_comm.Get_size(), dtype=np.int64)
-
-        tmp_nz_rows_size[_comm.Get_rank()] = nonzero_rows.size
-        tmp_nz_cols_size[_comm.Get_rank()] = nonzero_cols.size
-
-        nz_rows_size = np.zeros(_comm.Get_size(), dtype=np.int64)
-        nz_cols_size = np.zeros(_comm.Get_size(), dtype=np.int64)
-
-        _comm.Allreduce(tmp_nz_rows_size, nz_rows_size)
-        _comm.Allreduce(tmp_nz_cols_size, nz_cols_size)
-
-        all_nonzero_rows = np.zeros(nz_rows_size.sum(), dtype=np.int64)
-        all_nonzero_cols = np.zeros(nz_cols_size.sum(), dtype=np.int64)
-
-        _comm.Allgatherv(nonzero_rows, [all_nonzero_rows, nz_rows_size])
-        _comm.Allgatherv(nonzero_cols, [all_nonzero_cols, nz_cols_size])
-
-        nonzero_rows = all_nonzero_rows
-        nonzero_cols = all_nonzero_cols
-
-        nonzero_rows, nonzero_cols = _combine_nonzero_elements(nonzero_rows, nonzero_cols)
-
-    return nonzero_rows, nonzero_cols
-
-
-class MPISchurComplementLinearSolver(LinearSolverInterface):
+class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
     """
 
     Solve the system Ax = b.
@@ -154,13 +48,14 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
     def __init__(self, subproblem_solvers: Dict[int, LinearSolverInterface],
                  schur_complement_solver: LinearSolverInterface):
         self.subproblem_solvers = subproblem_solvers
-        self.schur_complement_solver = schur_complement_solver
+        #self.schur_complement_solver = schur_complement_solver
         self.block_dim = 0
         self.block_matrix = None
         self.local_block_indices = list()
         self.schur_complement = coo_matrix((0, 0))
         self.border_matrices: Dict[int, _BorderMatrix] = dict()
         self.sc_data_slices = dict()
+        self._preconditioner = None
 
     def do_symbolic_factorization(self,
                                   matrix: MPIBlockMatrix,
@@ -288,7 +183,7 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
 
         res = LinearSolverResults()
         res.status = LinearSolverStatus.successful
-        timer.start('form SC')
+        #timer.start('form SC')
         for ndx in self.local_block_indices:
             timer.start('factorize')
             sub_res = self.subproblem_solvers[ndx].do_numeric_factorization(matrix=block_matrix.get_block(ndx, ndx),
@@ -302,62 +197,11 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
             if raise_on_error:
                 raise RuntimeError('Numeric factorization unsuccessful; status: ' + str(res.status))
             else:
-                timer.stop('form SC')
+                #timer.stop('form SC')
                 return res
 
-        # in a scipy csr_matrix,
-        #     data contains the values
-        #     indices contains the column indices
-        #     indptr contains the number of nonzeros in the row
-        self.schur_complement.data = np.zeros(self.schur_complement.data.size, dtype=np.double)
-        for ndx in self.local_block_indices:
-            border_matrix: _BorderMatrix = self.border_matrices[ndx]
-            A = border_matrix.csr
-            _rhs = np.zeros(A.shape[1], dtype=np.double)
-            solver = self.subproblem_solvers[ndx]
-            for row_ndx in border_matrix.nonzero_rows:
-                for indptr in range(A.indptr[row_ndx], A.indptr[row_ndx + 1]):
-                    col = A.indices[indptr]
-                    val = A.data[indptr]
-                    _rhs[col] += val
-                timer.start('back solve')
-                contribution = solver.do_back_solve(_rhs)
-                timer.stop('back solve')
-                timer.start('dot product')
-                contribution = A.dot(contribution)
-                timer.stop('dot product')
-                self.schur_complement.data[self.sc_data_slices[ndx][row_ndx]] -= contribution[border_matrix.nonzero_rows]
-                for indptr in range(A.indptr[row_ndx], A.indptr[row_ndx + 1]):
-                    col = A.indices[indptr]
-                    val = A.data[indptr]
-                    _rhs[col] -= val
 
-        timer.start('communicate')
-        timer.start('zeros')
-        sc = np.zeros(self.schur_complement.data.size, dtype=np.double)
-        timer.stop('zeros')
-        timer.start('Barrier')
-        comm.Barrier()
-        timer.stop('Barrier')
-        timer.start('Allreduce')
-        comm.Allreduce(self.schur_complement.data, sc)
-        timer.stop('Allreduce')
-        self.schur_complement.data = sc
-        timer.start('add')
-        sc = self.schur_complement + block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
-        timer.stop('add')
-        timer.stop('communicate')
-        timer.stop('form SC')
 
-        timer.start('factor SC')
-        sub_res = self.schur_complement_solver.do_symbolic_factorization(sc, raise_on_error=raise_on_error)
-        _process_sub_results(res, sub_res)
-        if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
-            timer.stop('factor SC')
-            return res
-        sub_res = self.schur_complement_solver.do_numeric_factorization(sc)
-        _process_sub_results(res, sub_res)
-        timer.stop('factor SC')
         return res
 
     def do_back_solve(self, rhs, timer=None, barrier=None):
@@ -376,7 +220,6 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
         """
         if timer is None:
             timer = HierarchicalTimer()
-        timer.start('back_solve')
 
         schur_complement_rhs = np.zeros(rhs.get_block(self.block_dim - 1).size, dtype='d')
         for ndx in self.local_block_indices:
@@ -388,7 +231,16 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
         schur_complement_rhs = rhs.get_block(self.block_dim - 1) + res
 
         result = rhs.copy_structure()
-        coupling = self.schur_complement_solver.do_back_solve(schur_complement_rhs)
+
+        # TODO: Set tolerance according to rule from paper
+        # TODO: LinearSolveroptions  - also relevant for preconditioner
+        if barrier is None:
+            tol = 1e-8
+        else:
+            tol = barrier
+        coupling, info = self.pcg_schur_solve(schur_complement_rhs=schur_complement_rhs, timer=timer, tol=tol)
+
+        #coupling = self.schur_complement_solver.do_back_solve(schur_complement_rhs)
 
         for ndx in self.local_block_indices:
             A = self.block_matrix.get_block(self.block_dim-1, ndx)
@@ -397,7 +249,6 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
 
         result.set_block(self.block_dim-1, coupling)
 
-        timer.stop('back_solve')
 
         return result
 
@@ -428,13 +279,10 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
         num_neg = comm.allreduce(num_neg)
         num_zero = comm.allreduce(num_zero)
 
-        _pos, _neg, _zero = self.schur_complement_solver.get_inertia()
-
-        if _neg > 0 or _zero > 0:
-            print('WARNING: Schur complement has negative or zero eigenvalues.')
-        num_pos += _pos
-        num_neg += _neg
-        num_zero += _zero
+        #_pos, _neg, _zero = self.schur_complement_solver.get_inertia()
+        #num_pos += _pos
+        #num_neg += _neg
+        #num_zero += _zero
 
         return num_pos, num_neg, num_zero
 
@@ -452,4 +300,101 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
         for ndx in self.local_block_indices:
             sub_solver = self.subproblem_solvers[ndx]
             sub_solver.increase_memory_allocation(factor=factor)
-        self.schur_complement_solver.increase_memory_allocation(factor=factor)
+
+
+    def pcg_schur_solve(self, schur_complement_rhs, timer=None, tol=1e-8):
+
+        if timer is None:
+            timer = HierarchicalTimer()
+
+        timer.start('pcg')
+        D = self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
+
+        def schur_matvec_mpi(u):
+            res = np.zeros_like(u)
+            for ndx in self.local_block_indices:
+                border_matrix: _BorderMatrix = self.border_matrices[ndx]
+                A = border_matrix.csr.transpose()
+                #A = self.block_matrix.get_block(self.block_dim-1, ndx).toarray()
+                #A = self.block_matrix.get_block(ndx,self.block_dim-1)
+                timer.start('dot_product')
+                v = A.dot(u)
+                timer.stop('dot_product')
+                timer.start('back_solve')
+                x = self.subproblem_solvers[ndx].do_back_solve(v)
+                timer.stop('back_solve')
+                timer.start('dot_product')
+                y = A.transpose().dot(x)
+                timer.stop('dot_product')
+                res -= y
+
+            timer.start('communicate')
+            res_global = np.empty(res.size)
+            comm.Allreduce(res, res_global)
+            timer.stop('communicate')
+            res_global += D.dot(u)
+            return res_global
+
+
+        if self._preconditioner is None:
+            precond_mv = lambda u: u
+        else:
+            precond_mv = lambda u: self._preconditioner.dot(u)
+                #L-BFGS update based on s_iterates, y_iterates
+
+
+            
+
+        lin_op = LinearOperator(shape=D.shape, matvec=schur_matvec_mpi, dtype=float)
+
+        precond = LinearOperator(shape=D.shape, matvec=precond_mv, dtype=float)
+
+        #iters = 0
+        # def nonlocal_iterate(xk):
+        #     nonlocal rank
+        #     if rank == 0:
+        #         nonlocal iters
+        #         iters+=1
+        from numpy.typing import NDArray
+        from collections import deque
+        ns: int = D.shape[0]
+        mem_len: int = 10
+        prev_x = np.zeros_like(schur_complement_rhs)
+        #s_iterates: List[NDArray] = list()
+        s_iterates = deque(maxlen=mem_len)
+        pcg_iter: int = 0
+        mem_len: int = 10
+        def save_delta_x(xk):
+            timer.start('precondition')
+            nonlocal prev_x
+            nonlocal pcg_iter
+            pcg_iter += 1
+            delta_x = xk - prev_x
+            s_iterates.appendleft(delta_x)
+            prev_x = xk
+            timer.stop('precondition')
+
+        coupling, info = cg(A=lin_op, b=schur_complement_rhs, tol=1e-8, callback=save_delta_x, maxiter=ns)
+
+        # timer.start('precondition')
+        y_iterates = deque([schur_matvec_mpi(s_iterate) for s_iterate in s_iterates])
+        sl = s_iterates.popleft()
+        yl = y_iterates.popleft()
+        M = (sl.T.dot(yl) / yl.T.dot(yl)) * np.eye(ns)
+        V = np.empty_like(M)
+        while s_iterates and y_iterates:
+            s = s_iterates.popleft()
+            y = y_iterates.popleft()
+            if y.T.dot(s) > 0:
+                rho = 1.0 / (y.T.dot(s))
+                V = np.eye(ns) - rho * y.dot(s.T)
+                M = V.T.dot(M).dot(V) + rho * s.dot(s.T)
+
+        self._preconditioner = M
+        # self._y_iterates = y_iterates
+        # self._s_iterates = s_iterates
+        # timer.stop('precondition')
+        #print(f'num_iter: {iters}')
+        #print(f'info: {info}')
+        timer.stop('pcg')
+        return coupling, info

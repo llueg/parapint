@@ -268,7 +268,13 @@ def main(args, subproblem_solver_class, subproblem_solver_options):
         schur_complement_solver=subproblem_solver_class(**subproblem_solver_options))
     options = parapint.algorithms.IPOptions()
     options.linalg.solver = linear_solver
-    status = parapint.algorithms.ip_solve(interface=interface, options=options)
+    options.report_timing = False
+    from pyomo.common.timing import HierarchicalTimer
+    timer = HierarchicalTimer()
+    status = parapint.algorithms.ip_solve(interface=interface, options=options, timer=timer)
+    import time
+    time.sleep(rank)
+    print(timer)
     assert status == parapint.algorithms.InteriorPointStatus.optimal
     interface.load_primals_into_pyomo_model()
 
