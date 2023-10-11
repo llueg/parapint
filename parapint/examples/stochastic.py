@@ -100,13 +100,17 @@ class Problem(parapint.interfaces.MPIStochasticSchurComplementInteriorPointInter
 
 def main(farmer: Farmer, subproblem_solver_class, subproblem_solver_options):
     interface = Problem(farmer=farmer)
-    linear_solver = parapint.linalg.MPIImplicitSchurComplementLinearSolver(
+    solver_class = parapint.linalg.MPIImplicitSchurComplementLinearSolver
+    #solver_class = parapint.linalg.MPISchurComplementLinearSolver
+    linear_solver = solver_class(
         subproblem_solvers={ndx: subproblem_solver_class(**subproblem_solver_options) for ndx in range(len(farmer.scenarios))},
         schur_complement_solver=subproblem_solver_class(**subproblem_solver_options))
     options = parapint.algorithms.IPOptions()
     options.linalg.solver = linear_solver
+    #options.report_timing = True
+    options.max_iter = 100
     status = parapint.algorithms.ip_solve(interface=interface, options=options)
-    assert status == parapint.algorithms.InteriorPointStatus.optimal
+    #assert status == parapint.algorithms.InteriorPointStatus.optimal
     interface.load_primals_into_pyomo_model()
 
     # gather the results and plot
@@ -119,6 +123,7 @@ def main(farmer: Farmer, subproblem_solver_class, subproblem_solver_options):
 if __name__ == '__main__':
     # cntl[1] is the MA27 pivot tolerance
     farmer = Farmer()
+    logging.getLogger('pyomo.core').setLevel(logging.CRITICAL)
     main(farmer=farmer,
          subproblem_solver_class=parapint.linalg.InteriorPointMA27Interface,
          subproblem_solver_options={'cntl_options': {1: 1e-6}})

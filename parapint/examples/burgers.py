@@ -37,9 +37,9 @@ class Args(object):
 
     def parse_arguments(self):
         parser = argparse.ArgumentParser()
-        parser.add_argument('--nfe_x', type=int, required=True, help='number of finite elements for x')
-        parser.add_argument('--nfe_t', type=int, required=True, help='number of finite elements for t')
-        parser.add_argument('--nblocks', type=int, required=True, help='number of time blocks for schur complement')
+        parser.add_argument('--nfe_x', type=int, required=False, default=50, help='number of finite elements for x')
+        parser.add_argument('--nfe_t', type=int, required=False, default=100, help='number of finite elements for t')
+        parser.add_argument('--nblocks', type=int, required=False, default=4, help='number of time blocks for schur complement')
         parser.add_argument('--no_plot', action='store_true')
         parser.add_argument('--no_show_plot', action='store_true')
         args = parser.parse_args()
@@ -263,7 +263,8 @@ def main(args, subproblem_solver_class, subproblem_solver_options):
                                  num_time_blocks=args.nblocks,
                                  nfe_t=args.nfe_t,
                                  nfe_x=args.nfe_x)
-    linear_solver = parapint.linalg.MPISchurComplementLinearSolver(
+    solver_class = parapint.linalg.MPISchurComplementLinearSolver
+    linear_solver = solver_class(
         subproblem_solvers={ndx: subproblem_solver_class(**subproblem_solver_options) for ndx in range(args.nblocks)},
         schur_complement_solver=subproblem_solver_class(**subproblem_solver_options))
     options = parapint.algorithms.IPOptions()

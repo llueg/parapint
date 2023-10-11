@@ -155,6 +155,7 @@ def main(subproblem_solver_class, subproblem_solver_options, show_plot=True):
                         constant_control_duration=constant_control_duration,
                         time_scale=time_scale,
                         num_time_blocks=num_time_blocks)
+    
     linear_solver = parapint.linalg.MPISchurComplementLinearSolver(
         subproblem_solvers={ndx: subproblem_solver_class(**subproblem_solver_options) for ndx in range(num_time_blocks)},
         schur_complement_solver=subproblem_solver_class(**subproblem_solver_options))

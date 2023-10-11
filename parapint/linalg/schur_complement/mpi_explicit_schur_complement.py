@@ -3,6 +3,7 @@ from pyomo.contrib.pynumero.sparse.mpi_block_vector import MPIBlockVector
 from parapint.linalg.base_linear_solver_interface import LinearSolverInterface
 from parapint.linalg.results import LinearSolverStatus, LinearSolverResults
 import numpy as np
+import scipy
 from scipy.sparse import coo_matrix, csr_matrix
 from mpi4py import MPI
 import itertools
@@ -348,6 +349,8 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
         timer.stop('add')
         timer.stop('communicate')
         timer.stop('form SC')
+        cond = np.linalg.cond(sc.toarray())
+        print(f'SC condition number: {cond}')
 
         timer.start('factor SC')
         sub_res = self.schur_complement_solver.do_symbolic_factorization(sc, raise_on_error=raise_on_error)
@@ -360,7 +363,7 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
         timer.stop('factor SC')
         return res
 
-    def do_back_solve(self, rhs, timer=None, barrier=None):
+    def do_back_solve(self, rhs, timer=None, barrier=None, ip_iter=None):
         """
         Performs a back solve with the factorized matrix. Should only be called after
         do_numeric_factorixation.

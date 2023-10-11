@@ -563,7 +563,7 @@ def ip_solve(interface: BaseInteriorPointInterface,
         timer.stop('factorize')
 
         timer.start('back solve')
-        delta = options.linalg.solver.do_back_solve(rhs, timer, barrier_parameter)
+        delta = options.linalg.solver.do_back_solve(rhs, timer, barrier_parameter, _iter)
         timer.stop('back solve')
 
         interface.set_primal_dual_kkt_solution(delta)
