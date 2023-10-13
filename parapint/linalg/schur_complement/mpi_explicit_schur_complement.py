@@ -349,8 +349,8 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
         timer.stop('add')
         timer.stop('communicate')
         timer.stop('form SC')
-        cond = np.linalg.cond(sc.toarray())
-        print(f'SC condition number: {cond}')
+        #cond = np.linalg.cond(sc.toarray())
+        #print(f'SC condition number: {cond}')
 
         timer.start('factor SC')
         sub_res = self.schur_complement_solver.do_symbolic_factorization(sc, raise_on_error=raise_on_error)

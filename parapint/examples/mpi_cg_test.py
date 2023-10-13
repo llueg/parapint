@@ -17,9 +17,9 @@ rank = comm.Get_rank()
 size = comm.Get_size()
 
 rng = default_rng(11)
-n_blocks = 4
-block_size = 3
-sc_size = 5
+n_blocks = 10
+block_size = 4
+sc_size = 8
 rank_by_index = list()
 for ndx in range(n_blocks - 1):
     for _rank in range(size):
@@ -35,13 +35,13 @@ A = MPIBlockMatrix(nbrows=n_blocks,
 local_A = BlockMatrix(n_blocks, n_blocks)
 
 for k in range(n_blocks - 1):
-    d_block = coo_matrix(sp.random(m=block_size,n=block_size, density=0.4, random_state=rng) + (block_size/2) * np.eye(block_size), dtype=np.double)
+    d_block = coo_matrix(sp.random(m=block_size,n=block_size, density=0.2, random_state=rng) + (block_size/2) * np.eye(block_size), dtype=np.double)
     local_A.set_block(k, k, d_block)
     if rank_by_index[k] == rank:
         A.set_block(k, k, d_block)
 
 for k in range(n_blocks - 1):
-    b_block = coo_matrix(sp.random(m=block_size,n=sc_size, density=0.2, random_state=rng), dtype=np.double)
+    b_block = coo_matrix(sp.random(m=block_size,n=sc_size, density=0.1, random_state=rng), dtype=np.double)
     local_A.set_block(n_blocks - 1, k, b_block.transpose(copy=True))
     local_A.set_block(k, n_blocks - 1, b_block)
     if rank_by_index[k] == rank:
@@ -79,11 +79,12 @@ pos_sc = np.count_nonzero(eig_sc > 0)
 neg_sc = np.count_nonzero(eig_sc < 0)
 zero_sc = np.count_nonzero(eig_sc == 0)
 inertia_sc = (pos_sc, neg_sc, zero_sc)
-print(f'sc inertia: {inertia_sc}')
+print(f'Conition SC: {np.max(np.abs(eig_sc))/np.min(np.abs(eig_sc))}')
+print(f'SC inertia: {inertia_sc}')
 
 implicit_timer = HierarchicalTimer()
 implicit_sc_solver = parapint.linalg.MPIImplicitSchurComplementLinearSolver(subproblem_solvers={ndx: ScipyInterface(compute_inertia=True) for ndx in range(n_blocks - 1)},
-                            schur_complement_solver=ScipyInterface(compute_inertia=True))
+                            schur_complement_solver=ScipyInterface(compute_inertia=True), diagnostic_flag=True)
 implicit_timer.start('symbolic_factorization')
 implicit_sc_solver.do_symbolic_factorization(A, timer=implicit_timer)
 implicit_timer.stop('symbolic_factorization')
