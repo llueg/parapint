@@ -13,6 +13,7 @@ import itertools
 from .explicit_schur_complement import _process_sub_results
 from typing import Dict, Optional, List, Callable, Tuple
 from pyomo.common.timing import HierarchicalTimer
+import copy
 
 from .mpi_explicit_schur_complement import _gather_results, _BorderMatrix, _get_all_nonzero_elements_in_sc, \
       _get_all_nonzero_elements_in_sc, _process_sub_results
@@ -49,7 +50,7 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
 
     """
     def __init__(self, subproblem_solvers: Dict[int, LinearSolverInterface],
-                 schur_complement_solver: LinearSolverInterface, diagnostic_flag: bool = False):
+                 schur_complement_solver: LinearSolverInterface, options: Dict):
         self.subproblem_solvers = subproblem_solvers
         #self.schur_complement_solver = schur_complement_solver
         self.block_dim = 0
@@ -58,10 +59,33 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
         #self.schur_complement = coo_matrix((0, 0))
         self.border_matrices: Dict[int, _BorderMatrix] = dict()
         self.sc_data_slices = dict()
-        self._preconditioner = PREQN(options={'memory': 20})
-        self._diagnostic_flag = diagnostic_flag
+        self._diagnostic_flag = options['diagnostic_flag']
+        if options['preconditioner']['type'] == 'bfgs':
+            _preconditioner = BfgsPreqn(H_strategy='all', diagnostic_flag=self._diagnostic_flag)
+        elif options['preconditioner']['type'] == 'lbfgs':
+            _preconditioner = LbfgsPreqn(memory=options['preconditioner']['memory'],
+                                         strategy=options['preconditioner']['strategy'],
+                                         diagnostic_flag=self._diagnostic_flag)
+        else:
+            raise NotImplementedError
+        
+        self._cg = ConjugateGradientSolver(tol=options['cg']['tol'],
+                                           max_iter=options['cg']['max_iter'],
+                                           stopping_criteria=options['cg']['stopping_criteria'],
+                                           beta_update=options['cg']['beta_update'],
+                                           beta_restart=options['cg']['beta_restart'],
+                                           preconditioner=_preconditioner)
+
+        self._adjust_sc_tol: bool = options['adjust_sc_tol']
+        self._sc_tol_reduction_factor = options['sc_tol_reduction_factor']
+        self._facorize_sc_flag = self._diagnostic_flag
         self.schur_complement_solver = schur_complement_solver
+        self._factorize_sc_strategy = options['factorize_sc_strategy']
+        if self._factorize_sc_strategy == 'start':
+            self._facorize_sc_flag = True
         self._diagnostic_info = dict()
+        self._prev_coupling: NDArray = np.empty(0)
+        self._initialize_pcg = options['initialize_pcg']
 
     def do_symbolic_factorization(self,
                                   matrix: MPIBlockMatrix,
@@ -105,14 +129,14 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
 
         res = LinearSolverResults()
         res.status = LinearSolverStatus.successful
-        timer.start('factorize')
+        timer.start('block_factorize')
         for ndx in self.local_block_indices:
             sub_res = self.subproblem_solvers[ndx].do_symbolic_factorization(matrix=block_matrix.get_block(ndx, ndx),
                                                                              raise_on_error=False)
             _process_sub_results(res, sub_res)
             if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
                 break
-        timer.stop('factorize')
+        timer.stop('block_factorize')
         res = _gather_results(res)
         if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
             if raise_on_error:
@@ -137,7 +161,7 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
         for ndx in self.local_block_indices:
             self.border_matrices[ndx] = _BorderMatrix(block_matrix.get_block(self.block_dim - 1, ndx))
         timer.stop('build_border_matrices')
-        if self._diagnostic_flag:
+        if self._facorize_sc_flag:
             timer.start('gather_all_nonzero_elements')
             nonzero_rows, nonzero_cols = _get_all_nonzero_elements_in_sc(self.border_matrices)
             timer.stop('gather_all_nonzero_elements')
@@ -190,12 +214,11 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
 
         res = LinearSolverResults()
         res.status = LinearSolverStatus.successful
-        timer.start('form SC')
         for ndx in self.local_block_indices:
-            timer.start('factorize')
+            timer.start('block_factorize')
             sub_res = self.subproblem_solvers[ndx].do_numeric_factorization(matrix=matrix.get_block(ndx, ndx),
                                                                             raise_on_error=False)
-            timer.stop('factorize')
+            timer.stop('block_factorize')
             _process_sub_results(res, sub_res)
             if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
                 break
@@ -204,9 +227,9 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
             if raise_on_error:
                 raise RuntimeError('Numeric factorization unsuccessful; status: ' + str(res.status))
             else:
-                timer.stop('form SC')
                 return res
-        if self._diagnostic_flag:
+        if self._facorize_sc_flag:
+            timer.start('form SC')
             self.schur_complement.data = np.zeros(self.schur_complement.data.size, dtype=np.double)
             for ndx in self.local_block_indices:
                 border_matrix: _BorderMatrix = self.border_matrices[ndx]
@@ -218,12 +241,12 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
                         col = A.indices[indptr]
                         val = A.data[indptr]
                         _rhs[col] += val
-                    timer.start('back solve')
+                    timer.start('block_back_solve')
                     contribution = solver.do_back_solve(_rhs)
-                    timer.stop('back solve')
-                    timer.start('dot product')
+                    timer.stop('block_back_solve')
+                    timer.start('dot_product')
                     contribution = A.dot(contribution)
-                    timer.stop('dot product')
+                    timer.stop('dot_product')
                     self.schur_complement.data[self.sc_data_slices[ndx][row_ndx]] -= contribution[border_matrix.nonzero_rows]
                     for indptr in range(A.indptr[row_ndx], A.indptr[row_ndx + 1]):
                         col = A.indices[indptr]
@@ -258,6 +281,8 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
             sub_res = self.schur_complement_solver.do_numeric_factorization(sc)
             _process_sub_results(res, sub_res)
             timer.stop('factor SC')
+        else:
+            pass
 
         return res
 
@@ -278,56 +303,94 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
         if timer is None:
             timer = HierarchicalTimer()
 
-        timer.start('rhs')
+        timer.start('form_rhs')
         schur_complement_rhs = np.zeros(rhs.get_block(self.block_dim - 1).size, dtype='d')
         for ndx in self.local_block_indices:
             A = self.block_matrix.get_block(self.block_dim-1, ndx)
-            timer.start('back_solve')
+            timer.start('block_back_solve')
             contribution  = self.subproblem_solvers[ndx].do_back_solve(rhs.get_block(ndx))
-            timer.stop('back_solve')
+            timer.stop('block_back_solve')
+            timer.start('dot_product')
             schur_complement_rhs -= A.tocsr().dot(contribution.flatten())
+            timer.stop('dot_product')
         res = np.zeros(rhs.get_block(self.block_dim - 1).shape[0], dtype='d')
+        timer.start('communicate')
+        timer.start('Allreduce')
         comm.Allreduce(schur_complement_rhs, res)
+        timer.stop('Allreduce')
+        timer.stop('communicate')
         schur_complement_rhs = rhs.get_block(self.block_dim - 1) + res
-        timer.stop('rhs')
+
         result = rhs.copy_structure()
+        timer.stop('form_rhs')
 
         # TODO: Set tolerance according to rule from paper
-        # TODO: LinearSolveroptions  - also relevant for preconditioner
-        if barrier is None:
-            tol = 1e-8
+        if barrier is None or not self._adjust_sc_tol:
+            tol = self._cg.tol
         else:
-            tol = barrier
+            tol = np.maximum(self._cg.tol, barrier * self._sc_tol_reduction_factor)
+
+        # if ip_iter == 0:
+        #     ls = copy.copy(self.schur_complement_solver)
+        #     def _precond_0(v):
+        #         return ls.do_back_solve(v)
+        #     self._tmp_precond = _precond_0
+        #     self._facorize_sc_flag = False
+        
+        if self._initialize_pcg:
+            if ip_iter == 0:
+                self._prev_coupling = np.zeros_like(schur_complement_rhs)
+            x0 = self._prev_coupling
+        else:
+            x0 = None
+
         timer.start('pcg')
         coupling, info = self.pcg_schur_solve(schur_complement_rhs=schur_complement_rhs, ip_iter=ip_iter,
-                                              timer=timer, tol=tol)
+                                              timer=timer, tol=tol, x0=x0)
         timer.stop('pcg')
 
+        if self._initialize_pcg:
+            self._prev_coupling = coupling
+
         # logging
+        pcg_info = dict()
+        pcg_info['num_iter'] = info['n_iter']
         if self._diagnostic_flag:
-            pcg_info = dict()
             sc = self.schur_complement + self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
             sc_eigs = np.linalg.eigvals(sc.toarray())
             pcg_info['cond_S'] = np.max(np.abs(sc_eigs)) / np.min(np.abs(sc_eigs))
-            psc_eigs = np.linalg.eigvals(self._preconditioner.H @ sc.toarray())
+            hsc = self._cg._preconditioner.H @ sc.toarray()
+            psc_eigs = np.linalg.eigvals(hsc)
             pcg_info['cond_HS'] = np.max(np.abs(psc_eigs)) / np.min(np.abs(psc_eigs))
             pcg_info['num_iter'] = info['n_iter']
             pcg_info['residuals'] = info['residuals']
-            self._diagnostic_info[ip_iter] = pcg_info
+            pcg_info['eig_S'] = sc_eigs
+            pcg_info['eig_HS'] = psc_eigs
+            ns = rhs.size
+            pcg_info['sparsity_S'] = np.count_nonzero(sc.toarray())/(ns **2)
+            pcg_info['sparsity_HS'] = np.count_nonzero(hsc)/(ns **2)
+        self._diagnostic_info[ip_iter] = pcg_info
 
+        ns = rhs.size
+        if self._factorize_sc_strategy == 'start':
+            if (not self._diagnostic_flag) and ip_iter > 0:
+                self._facorize_sc_flag = False
+        elif self._factorize_sc_strategy == 'adaptive':
+            if self._facorize_sc_flag and not self._diagnostic_flag and ip_iter > 0:
+                if info['n_iter'] < ns:
+                    self._facorize_sc_flag = False
         # TODO: Return when negative curvature is detected
         # if self._diagnostic_flag:
         #     _coupling = self.schur_complement_solver.do_back_solve(schur_complement_rhs)
 
-        timer.start('block_back_solve')
+        
         for ndx in self.local_block_indices:
+            timer.start('block_back_solve')
             A = self.block_matrix.get_block(self.block_dim-1, ndx)
             result.set_block(ndx, self.subproblem_solvers[ndx].do_back_solve(rhs.get_block(ndx) -
                                                                              A.tocsr().transpose().dot(coupling.flatten())))
-
+            timer.stop('block_back_solve')
         result.set_block(self.block_dim-1, coupling)
-        timer.stop('block_back_solve')
-
 
         return result
 
@@ -382,7 +445,7 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
             sub_solver.increase_memory_allocation(factor=factor)
 
 
-    def pcg_schur_solve(self, schur_complement_rhs, ip_iter, timer=None, tol=1e-8):
+    def pcg_schur_solve(self, schur_complement_rhs, ip_iter, timer=None, tol=1e-8, x0=None):
 
         if timer is None:
             timer = HierarchicalTimer()
@@ -394,14 +457,12 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
             for ndx in self.local_block_indices:
                 border_matrix: _BorderMatrix = self.border_matrices[ndx]
                 A = border_matrix.csr.transpose()
-                #A = self.block_matrix.get_block(self.block_dim-1, ndx).toarray()
-                #A = self.block_matrix.get_block(ndx,self.block_dim-1)
                 timer.start('dot_product')
                 v = A.dot(u)
                 timer.stop('dot_product')
-                timer.start('back_solve')
+                timer.start('block_back_solve')
                 x = self.subproblem_solvers[ndx].do_back_solve(v)
-                timer.stop('back_solve')
+                timer.stop('block_back_solve')
                 timer.start('dot_product')
                 y = A.transpose().dot(x)
                 timer.stop('dot_product')
@@ -415,89 +476,69 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
             res_global += D.dot(u)
             return res_global
 
+        coupling, info = self._cg.solve(linear_operator=schur_matvec_mpi,
+                                        rhs=schur_complement_rhs,
+                                        tol=tol,
+                                        ip_iter=ip_iter,
+                                        x0=x0, timer=timer)
 
-        # if self._preconditioner is None:
-        #     precond_mv = lambda u: u
-        # else:
-        #     precond_mv = lambda u: self._preconditioner.dot(u)
-        #         #L-BFGS update based on s_iterates, y_iterates
-
-
-            
-
-        #lin_op = LinearOperator(shape=D.shape, matvec=schur_matvec_mpi, dtype=float)
-
-        # precond = LinearOperator(shape=D.shape, matvec=precond_mv, dtype=float)
-
-        #iters = 0
-        # def nonlocal_iterate(xk):
-        #     nonlocal rank
-        #     if rank == 0:
-        #         nonlocal iters
-        #         iters+=1
-        
-        #ns: int = D.shape[0]
-        # mem_len: int = 10
-        # prev_x = np.zeros_like(schur_complement_rhs)
-        # #s_iterates: List[NDArray] = list()
-        # s_iterates = deque(maxlen=mem_len)
-        # pcg_iter: int = 0
-        # mem_len: int = 10
-        # def save_delta_x(xk):
-        #     timer.start('precondition')
-        #     nonlocal prev_x
-        #     nonlocal pcg_iter
-        #     pcg_iter += 1
-        #     delta_x = xk - prev_x
-        #     s_iterates.appendleft(delta_x)
-        #     prev_x = xk
-        #     timer.stop('precondition')
-
-        #coupling, info = cg(A=lin_op, b=schur_complement_rhs, tol=1e-8, callback=save_delta_x, maxiter=ns)
-        #coupling, info = cg(A=lin_op, b=schur_complement_rhs, tol=1e-8, maxiter=ns)
-
-        #def precond(u: NDArray) -> NDArray:
-        #    return self._preconditioner.preqn(ip_iter, pcg_iter, schur_complement_rhs, u, schur_matvec_mpi(u))
-        
-
-        coupling, info = self.cg(linear_operator=schur_matvec_mpi, rhs=schur_complement_rhs, tol=1e-7, maxiter=1000, ip_iter=ip_iter)
-        #print(f'ncg_iter: {info["n_iter"]}')
-        #print(f'status: {info["status"]}')
-        # timer.start('precondition')
-        # y_iterates = deque([schur_matvec_mpi(s_iterate) for s_iterate in s_iterates])
-        # sl = s_iterates.popleft()
-        # yl = y_iterates.popleft()
-        # M = (sl.T.dot(yl) / yl.T.dot(yl)) * np.eye(ns)
-        # V = np.empty_like(M)
-        # while s_iterates and y_iterates:
-        #     s = s_iterates.popleft()
-        #     y = y_iterates.popleft()
-        #     if y.T.dot(s) > 0:
-        #         rho = 1.0 / (y.T.dot(s))
-        #         V = np.eye(ns) - rho * y.dot(s.T)
-        #         M = V.T.dot(M).dot(V) + rho * s.dot(s.T)
-
-        # self._preconditioner = M
-        # self._y_iterates = y_iterates
-        # self._s_iterates = s_iterates
-        # timer.stop('precondition')
-        #print(f'num_iter: {iters}')
-        #print(f'info: {info}')
-        #timer.stop('pcg')
         return coupling, info
+
+
+class ConjugateGradientSolver:
+
+    def __init__(self,
+                 tol: float,
+                 max_iter: int,
+                 stopping_criteria: str,
+                 beta_update: str,
+                 beta_restart: bool,
+                 preconditioner: Preqn,
+                 direct_preconditioner: Optional[Callable] = None):
+        self._preconditioner = preconditioner
+        if stopping_criteria == 'inf_res':
+            def f_stopping_criteria(r_k, z_k, r_0, rhs):
+                return np.max(np.abs(r_k))
+        elif stopping_criteria == 'inf_rel_res':
+            def f_stopping_criteria(r_k, z_k, r_0, rhs):
+                return np.max(np.abs(r_k))/np.max(np.abs(r_0))
+        elif stopping_criteria == '2_rel_rhs':
+            def f_stopping_criteria(r_k, z_k, r_0, rhs):
+                return np.sqrt(r_k.T.dot(r_k))/np.sqrt(rhs.T.dot(rhs))
+        elif stopping_criteria == '2_H_res':
+            def f_stopping_criteria(r_k, z_k, r_0, rhs):
+                return np.sqrt(r_k.T.dot(z_k))
+        else:
+            raise NotImplementedError
+        self._compute_merit = f_stopping_criteria
+        self._stopping_criteria = stopping_criteria
+
+        if beta_update == 'FR':
+            def f_beta_update(norm1, norm2, r_k, z_prev):
+                return norm1 / norm2
+        elif beta_update == 'PR':
+            def f_beta_update(norm1, norm2, r_k, z_prev):
+                return (norm1 - r_k.T.dot(z_prev))/norm2
+        else:
+            raise NotImplementedError
+        self._compute_beta_update = f_beta_update
+        self._beta_update = beta_update
+
+        self._beta_restart = beta_restart
+
+        self._max_iter = max_iter
+        self.tol = tol
+        self._direct_preconditioner = direct_preconditioner
+        
     
-
-    def cg(self,
-           linear_operator: Callable[[NDArray], NDArray],
-           rhs: NDArray,
-           tol: float,
-           maxiter: int,
-           ip_iter: int,
-           #preconditioner: Optional[Callable[[NDArray], NDArray]] = None,
-           x0: Optional[NDArray] = None,
-           timer: Optional[HierarchicalTimer] = None
-           ) -> Tuple[NDArray, Dict]:
-
+    def solve(self,
+              linear_operator: Callable[[NDArray], NDArray],
+              rhs: NDArray,
+              tol: float,
+              ip_iter: int,
+              x0: Optional[NDArray] = None,
+              timer: Optional[HierarchicalTimer] = None,
+              ) -> Tuple[NDArray, Dict]:
         if timer is None:
             timer = HierarchicalTimer()
         
@@ -506,116 +547,175 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
         else:
             x_k: NDArray = x0.copy()
 
-        # if preconditioner is None:
-        #     preconditioner = lambda u: u
         info = dict()
         residuals = list()
         status: int = 1
 
-        #r_k: NDArray = rhs - linear_operator(x_k)
-        #old_sq_residual = r_k.T.dot(r_k)
         k = 0
-        #timer.start('pcg')
-        #p_k = r_k.copy()
-        r_k = - rhs.copy()
-        x_k = np.zeros_like(rhs)
-        #x_k = np.random.rand(rhs.size)
+        timer.start('SC_matvec')
+        if x0 is None:
+            r_k = - rhs.copy()
+        else:
+            r_k = linear_operator(x_k) - rhs
+        timer.stop('SC_matvec')
         d_k = np.empty_like(rhs)
         w_k = np.empty_like(rhs)
         z_k = np.empty_like(rhs)
+        z_k_prev = np.empty_like(rhs)
         n = rhs.size
+        #norm_rhs = np.sqrt(rhs.T.dot(rhs))
         norm1 = 0
-        for k in range(maxiter):
-            #z_k = preconditioner(r_k)
-            #z_k_prev = z_k
-            z_k = self._preconditioner.preqn(ip_iter, k, r_k, d_k, w_k)
+        r0 = np.max(np.abs(r_k))
+        for k in range(self._max_iter):
+            if self._beta_update == 'FR':
+                z_k_prev = z_k.copy()
+            # TODO: See if this makes sense generally - intermittently factorizing S - incorporate into preqn?
+            # if ip_iter > -1:
+            #     z_k = self._preconditioner.preqn(ip_iter, k, r_k, d_k, w_k)
+            # else:
+            #     zz_k = self._preconditioner.preqn(ip_iter, k, r_k, d_k, w_k)
+            #     z_k = self._tmp_precond(r_k)
+            timer.start('precondition')
+            z_k = self._preconditioner.preqn(ip_iter, k, r_k, d_k, w_k, timer)
+            timer.stop('precondition')
             norm2 = norm1
             norm1 = r_k.T.dot(z_k)
+            # TODO: Decide on stopping criteria
+            # alternative: ||r||/||b|| < tol
             #if np.sqrt(z_k.T.dot(z_k)) < tol:
-            residuals.append(np.max(np.abs(r_k)))
-            if np.max(np.abs(r_k)) < tol:
+            #residuals.append(np.sqrt(r_k.T.dot(z_k))/norm_rhs)
+            res = self._compute_merit(r_k, z_k, r0, rhs)
+            residuals.append(res)
+            if res < tol:
                status = 0
                break
             if k > 0:
-                # if np.mod(k, n) != 0:
-                #     beta = norm1 / norm2 
-                # else:
-                #     beta = 0
+                if np.mod(k, n) != 0 or not self._beta_restart:
+                    beta = self._compute_beta_update(norm1, norm2, r_k, z_k_prev)
+                else:
+                    beta = 0
                 beta = norm1 / norm2 
+                
                 #beta = (norm1 - r_k.T.dot(z_k_prev))/norm2
                 d_k = - z_k + beta * d_k
             else:
                 d_k = -z_k
 
+            timer.start('SC_matvec')
             w_k = linear_operator(d_k)
+            timer.stop('SC_matvec')
             denom = d_k.T.dot(w_k)
             if denom <= 0:
                 status = 2
-                #print(f'Negative curvature detected in CG {denom}')
                 print('WARNING: Schur complement has negative or zero eigenvalues. (PCG)')
-                #break
             
             alpha_k = norm1 / denom
             x_k += alpha_k * d_k
-            r_k += alpha_k * w_k
+            # Recomputing Residual - can help with roundoff
+            if np.mod(k, n) != 0:
+                r_k += alpha_k * w_k
+            else:
+                r_k = linear_operator(x_k) - rhs
+            #r_k += alpha_k * w_k
 
-            # if r_k.T.dot(r_k) < tol:
-            #     break            
-            
-            #norm2 = norm1
-            #norm1 = r_k.T.dot(z_k)
-        # for k in range(maxiter):
-        #     if k > 0:
-        #         if np.mod(k, n) != 0:
-        #             beta = norm1 / norm2 
-        #         else:
-        #             beta = 0
-
-        #         d_k = - z_k + beta * d_k
-        #     w_k = linear_operator(d_k)
-        #     denom = d_k.T.dot(w_k)
-        #     if denom <= 0:
-        #         info = 2
-        #         #print(f'Negative curvature detected in CG {denom}')
-        #         print('WARNING: Schur complement has negative or zero eigenvalues. (PCG)')
-        #         #break
-            
-        #     alpha_k = norm1 / denom
-        #     x_k += alpha_k * d_k
-        #     r_k += alpha_k * w_k
-
-        #     z_k = preconditioner(r_k)
-        #     if z_k.T.dot(z_k) < tol:
-        #         break
-        #     norm2 = norm1
-        #     norm1 = r_k.T.dot(z_k)
-
-        #timer.stop('pcg')
         info['residuals'] = np.array(residuals)
         info['status'] = status
         info['n_iter'] = k + 1
         return x_k, info
-    
 
 
-class PREQN:
 
-    def __init__(self, options: Dict):
-        self.options = options
-        self._mem_len = options['memory']
-        self._Y_STORE = deque(maxlen=options['memory'])
-        self._S_STORE = deque(maxlen=options['memory'])
-        self._RHO_STORE = deque(maxlen=options['memory'])
-        self._Y_STORE_NXT = deque(maxlen=options['memory'])
-        self._S_STORE_NXT = deque(maxlen=options['memory'])
-        self._RHO_STORE_NXT = deque(maxlen=options['memory'])
+class Preqn:
+    H: NDArray
+
+    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray,
+           timer: Optional[HierarchicalTimer] = None):
+        raise NotImplementedError
+
+class BfgsPreqn(Preqn):
+
+    def __init__(self, H_strategy: str = 'all',
+                 diagnostic_flag: bool = False):
+        self._H_strategy: str = H_strategy
+        self._diagnostic_flag: bool = diagnostic_flag
         self.H: NDArray = np.empty(())
-        self._strategy: str = 'last'
+        self.H_prev: NDArray = np.empty(())
+
+    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray,
+           timer: Optional[HierarchicalTimer] = None):
+        if timer is None:
+            timer = HierarchicalTimer()
+        n = residual.size
+        if cg_iter > 0:
+            if self._H_strategy == 'all':
+                timer.start('form_H')
+                y = w_k.reshape(-1,1)
+                s = d_k.reshape(-1,1)
+                rho = 1/(y.T.dot(s))
+                vv = (np.eye(n) - rho * y.dot(s.T))
+                self.H = vv.T @ self.H @ vv + rho * s.dot(s.T)
+                timer.stop('form_H')
+            else:
+                raise NotImplementedError
+
+        if ip_iter == 0:
+            # no preconditioning
+            self.H  = np.eye(n)
+            if self._diagnostic_flag:
+                self.H_prev = np.eye(n)
+            return residual
+        elif cg_iter == 0:
+            self.H_prev = self.H
+            #self.H = np.eye(n)
+        
+        timer.start('precond_matvec')
+        r = self.H_prev.dot(residual)
+        timer.stop('precond_matvec')
+
+        return r
+
+
+class LbfgsPreqn(Preqn):
+
+    def __init__(self, memory: int, strategy: str = 'uniform', diagnostic_flag: bool = False):
+        #self.options = options
+        self._mem_len: int = memory
+        self._strategy: str = strategy
+        self._diagnostic_flag: bool = diagnostic_flag
+        self._Y_STORE = deque(maxlen=self._mem_len)
+        self._S_STORE = deque(maxlen=self._mem_len)
+        self._RHO_STORE = deque(maxlen=self._mem_len)
+        self._Y_STORE_NXT = deque(maxlen=self._mem_len)
+        self._S_STORE_NXT = deque(maxlen=self._mem_len)
+        self._RHO_STORE_NXT = deque(maxlen=self._mem_len)
+        self.H: NDArray = np.empty(())
+        
         if self._strategy == 'uniform':
             assert np.mod(self._mem_len, 2) == 0
             self._cycle = 1
+            #self._k_indxs = np.zeros((self._mem_len/2))
+            self._l = np.arange(1, (self._mem_len/2) + 1)
+            self._k_indxs = []
 
-    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray):
+    def _uniform_sample(self, k: int):
+        k_indxs = ((self._mem_len/2) + self._l - 1) * (2 ** self._cycle)
+        in_idx = self._l[np.where(k_indxs == k)]
+        if len(in_idx) == 0:
+            return None, None
+        else:
+            l_out = (2*in_idx[0] - 1) * (2 ** (self._cycle - 1))
+            rem_idx = self._k_indxs.index(int(l_out))
+            self._k_indxs.remove(int(l_out))
+            self._k_indxs.append(k)
+            if in_idx[0] == self._mem_len/2:
+                self._cycle += 1
+            return k, rem_idx
+
+
+    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray,
+           timer: Optional[HierarchicalTimer] = None):
+        if timer is None:
+            timer = HierarchicalTimer()
         n = residual.size
         if cg_iter > 0:
             if self._strategy == 'last':
@@ -632,60 +732,61 @@ class PREQN:
                     self._Y_STORE_NXT.append(w_k.reshape(-1,1))
                     self._S_STORE_NXT.append(d_k.reshape(-1,1))
                     self._RHO_STORE_NXT.append(1.0/(w_k.T.dot(d_k)))
+                    self._k_indxs.append(cg_iter - 1)
                 else:
-                    # TODO
-                    pass
-
+                    _, k_out = self._uniform_sample(cg_iter - 1)
+                    if k_out is not None:
+                        #TODO: Not efficient in deques
+                        del self._Y_STORE_NXT[k_out]
+                        del self._S_STORE_NXT[k_out]
+                        del self._RHO_STORE_NXT[k_out]
+                        #del self._k_indxs[k_out]
+                        #self._k_indxs.append(cg_iter)
+                        self._Y_STORE_NXT.append(w_k.reshape(-1,1))
+                        self._S_STORE_NXT.append(d_k.reshape(-1,1))
+                        self._RHO_STORE_NXT.append(1.0/(w_k.T.dot(d_k)))
 
         if ip_iter == 0:
             # no preconditioning
-            self.H = np.eye(n)
+            if self._diagnostic_flag:
+                self.H = np.eye(n)
             return residual
         elif cg_iter == 0:
             if len(self._Y_STORE_NXT) > 0:
-                # empty deques
-                #self._Y_STORE.clear()
-                #self._S_STORE.clear()
-                #self._RHO_STORE.clear()
                 for _ in range(len(self._Y_STORE_NXT)):
                     self._Y_STORE.append(self._Y_STORE_NXT.pop())
                     self._S_STORE.append(self._S_STORE_NXT.pop())
                     self._RHO_STORE.append(self._RHO_STORE_NXT.pop())
                 #debug
-                y: NDArray = self._Y_STORE[-1]
-                s: NDArray = self._S_STORE[-1]
-                rho: NDArray = self._RHO_STORE[-1]
-                H: NDArray = (s.T.dot(y)/y.T.dot(y)) * np.eye(n)
-                for j in range(0, len(self._Y_STORE)-2):
-                    y: NDArray = self._Y_STORE[-(j+2)]
-                    s: NDArray = self._S_STORE[-(j+2)]
-                    rho: NDArray = self._RHO_STORE[-(j+2)]
-                    #H = (np.eye(n) - rho * s.dot(y.T)) @ H @ (np.eye(n) - rho * s.dot(y.T)) + rho * s.dot(s.T)
-                    vv = (np.eye(n) - rho * y.dot(s.T))
-                    H = vv.T @ H @ vv + rho * s.dot(s.T)
-                self.H = H
-                # y: NDArray = self._Y_STORE.pop()
-                # s: NDArray = self._S_STORE.pop()
-                # rho: NDArray = self._RHO_STORE.pop()
-                # H: NDArray = (s.T.dot(y)/y.T.dot(y)) * np.eye(n)
-                # for j in range(0, int(np.minimum(self.options['memory'] - 1, len(self._Y_STORE)))):
-                #     y: NDArray = self._Y_STORE.pop()
-                #     s: NDArray = self._S_STORE.pop()
-                #     rho: NDArray = self._RHO_STORE.pop()
-                #     #H = (np.eye(n) - rho * s.dot(y.T)) @ H @ (np.eye(n) - rho * s.dot(y.T)) + rho * s.dot(s.T)
-                #     vv = (np.eye(n) - rho * y.dot(s.T))
-                #     H = vv.T @ H @ vv + rho * s.dot(s.T)
-                # self.H = H
+                if self._diagnostic_flag:
+                    timer.start('form H')
+                    y: NDArray = self._Y_STORE[-1]
+                    s: NDArray = self._S_STORE[-1]
+                    rho: NDArray = self._RHO_STORE[-1]
+                    H: NDArray = (s.T.dot(y)/y.T.dot(y)) * np.eye(n)
+                    for j in range(0, len(self._Y_STORE)-2):
+                        y: NDArray = self._Y_STORE[-(j+2)]
+                        s: NDArray = self._S_STORE[-(j+2)]
+                        rho: NDArray = self._RHO_STORE[-(j+2)]
+                        #H = (np.eye(n) - rho * s.dot(y.T)) @ H @ (np.eye(n) - rho * s.dot(y.T)) + rho * s.dot(s.T)
+                        vv = (np.eye(n) - rho * y.dot(s.T))
+                        H = vv.T @ H @ vv + rho * s.dot(s.T)
+                    self.H = H
+                    timer.stop('form H')
             else:
-                self.H = np.eye(n)
+                if self._diagnostic_flag:
+                    self.H = np.eye(n)
+            
+            if self._strategy == 'uniform':
+                self._cycle = 1
+                self._k_indxs = []
 
             #assert self._Y_STORE.__len__() == 0 and self._S_STORE.__len__() == 0 and self._RHO_STORE.__len__() == 0
 
         # compute z = M^{-1} r
+        timer.start('precond_matvec')
         r2 = self._precond_mv(residual)
-        #r1 = self.H @ residual
-        #r3 = self._precond_mv2(residual)
-        #print(np.allclose(r1, r2))
+        timer.stop('precond_matvec')
         return r2
     
     def _precond_mv(self, u: NDArray) -> NDArray:
@@ -699,30 +800,8 @@ class PREQN:
 
         gamma: NDArray = (self._S_STORE[bound-1].T.dot(self._Y_STORE[bound-1])/self._Y_STORE[bound-1].T.dot(self._Y_STORE[bound-1]))
         r =  gamma.reshape(()) * q
-        #r = np.eye(n) @ q
-        #r = (self._RHO_STORE[0] * self._S_STORE[0].dot(self._S_STORE[0].T)) @ q
         for i in range(0, bound):
             beta = self._RHO_STORE[i] * self._Y_STORE[i].T.dot(r)
             r += self._S_STORE[i].flatten() * (alphas[i] - beta)
         
         return r
-
-    def _precond_mv2(self, u: NDArray) -> NDArray:
-        q: NDArray = u.copy()
-        n = u.size
-        bound: int = len(self._RHO_STORE)
-        alphas = np.zeros(bound)
-        for i in range(bound):
-            alphas[i] = self._RHO_STORE[i] * self._S_STORE[i].T.dot(q)
-            q -= alphas[i] * self._Y_STORE[i].flatten()
-
-        r = (self._S_STORE[bound-1].T.dot(self._Y_STORE[bound-1])/self._Y_STORE[bound-1].T.dot(self._Y_STORE[bound-1])) * np.eye(n) @ q
-        for i in reversed(range(0, bound-1)):
-            beta = self._RHO_STORE[i] * self._Y_STORE[i].T.dot(r)
-            r += self._S_STORE[i].flatten() * (alphas[i] - beta)
-        
-        return r
-
-
-        
-

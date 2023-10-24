@@ -205,14 +205,14 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
 
         res = LinearSolverResults()
         res.status = LinearSolverStatus.successful
-        timer.start('factorize')
+        timer.start('block_factorize')
         for ndx in self.local_block_indices:
             sub_res = self.subproblem_solvers[ndx].do_symbolic_factorization(matrix=block_matrix.get_block(ndx, ndx),
                                                                              raise_on_error=False)
             _process_sub_results(res, sub_res)
             if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
                 break
-        timer.stop('factorize')
+        timer.stop('block_factorize')
         res = _gather_results(res)
         if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
             if raise_on_error:
@@ -289,12 +289,12 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
 
         res = LinearSolverResults()
         res.status = LinearSolverStatus.successful
-        timer.start('form SC')
+        timer.start('form_SC')
         for ndx in self.local_block_indices:
-            timer.start('factorize')
+            timer.start('block_factorize')
             sub_res = self.subproblem_solvers[ndx].do_numeric_factorization(matrix=block_matrix.get_block(ndx, ndx),
                                                                             raise_on_error=False)
-            timer.stop('factorize')
+            timer.stop('block_factorize')
             _process_sub_results(res, sub_res)
             if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
                 break
@@ -303,7 +303,7 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
             if raise_on_error:
                 raise RuntimeError('Numeric factorization unsuccessful; status: ' + str(res.status))
             else:
-                timer.stop('form SC')
+                timer.stop('form_SC')
                 return res
 
         # in a scipy csr_matrix,
@@ -321,12 +321,12 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
                     col = A.indices[indptr]
                     val = A.data[indptr]
                     _rhs[col] += val
-                timer.start('back solve')
+                timer.start('block_back_solve')
                 contribution = solver.do_back_solve(_rhs)
-                timer.stop('back solve')
-                timer.start('dot product')
+                timer.stop('block_back_solve')
+                timer.start('dot_product')
                 contribution = A.dot(contribution)
-                timer.stop('dot product')
+                timer.stop('dot_product')
                 self.schur_complement.data[self.sc_data_slices[ndx][row_ndx]] -= contribution[border_matrix.nonzero_rows]
                 for indptr in range(A.indptr[row_ndx], A.indptr[row_ndx + 1]):
                     col = A.indices[indptr]
@@ -348,19 +348,19 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
         sc = self.schur_complement + block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
         timer.stop('add')
         timer.stop('communicate')
-        timer.stop('form SC')
+        timer.stop('form_SC')
         #cond = np.linalg.cond(sc.toarray())
         #print(f'SC condition number: {cond}')
 
-        timer.start('factor SC')
+        timer.start('factor_SC')
         sub_res = self.schur_complement_solver.do_symbolic_factorization(sc, raise_on_error=raise_on_error)
         _process_sub_results(res, sub_res)
         if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
-            timer.stop('factor SC')
+            timer.stop('factor_SC')
             return res
         sub_res = self.schur_complement_solver.do_numeric_factorization(sc)
         _process_sub_results(res, sub_res)
-        timer.stop('factor SC')
+        timer.stop('factor_SC')
         return res
 
     def do_back_solve(self, rhs, timer=None, barrier=None, ip_iter=None):
@@ -379,28 +379,40 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
         """
         if timer is None:
             timer = HierarchicalTimer()
-        timer.start('back_solve')
 
+        timer.start('form_rhs')
         schur_complement_rhs = np.zeros(rhs.get_block(self.block_dim - 1).size, dtype='d')
         for ndx in self.local_block_indices:
             A = self.block_matrix.get_block(self.block_dim-1, ndx)
+            timer.start('block_back_solve')
             contribution = self.subproblem_solvers[ndx].do_back_solve(rhs.get_block(ndx))
+            timer.stop('block_back_solve')
+            timer.start('dot_product')
             schur_complement_rhs -= A.tocsr().dot(contribution.flatten())
+            timer.stop('dot_product')
         res = np.zeros(rhs.get_block(self.block_dim - 1).shape[0], dtype='d')
+        timer.start('communicate')
+        timer.start('Allreduce')
         comm.Allreduce(schur_complement_rhs, res)
+        timer.stop('Allreduce')
+        timer.stop('communicate')
         schur_complement_rhs = rhs.get_block(self.block_dim - 1) + res
 
         result = rhs.copy_structure()
+        timer.stop('form_rhs')
+        timer.start('SC_back_solve')
         coupling = self.schur_complement_solver.do_back_solve(schur_complement_rhs)
+        timer.stop('SC_back_solve')
+
 
         for ndx in self.local_block_indices:
             A = self.block_matrix.get_block(self.block_dim-1, ndx)
+            timer.start('block_back_solve')
             result.set_block(ndx, self.subproblem_solvers[ndx].do_back_solve(rhs.get_block(ndx) -
                                                                              A.tocsr().transpose().dot(coupling.flatten())))
+            timer.stop('block_back_solve')
 
         result.set_block(self.block_dim-1, coupling)
-
-        timer.stop('back_solve')
 
         return result
 
