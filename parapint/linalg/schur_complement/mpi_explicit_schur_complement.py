@@ -75,30 +75,43 @@ def _get_nested_comms() -> List[MPI.Comm]:
     return nested_comms
 
 
-def _combine_nonzero_elements(rows, cols):
+def _combine_nonzero_elements(rows, cols, timer: Optional[HierarchicalTimer] = None):
+    if timer is None:
+        timer = HierarchicalTimer()
     nonzero_elements = list(zip(rows, cols))
     nonzero_elements = {i: None for i in nonzero_elements}
     nonzero_elements = list(nonzero_elements.keys())
+    timer.start('sort')
+    #print(f'rank {rank} sorting {len(nonzero_elements)} elements')
     nonzero_elements.sort()
+    timer.stop('sort')
     nonzero_rows, nonzero_cols = tuple(zip(*nonzero_elements))
     nonzero_rows = np.asarray(nonzero_rows, dtype=np.int64)
     nonzero_cols = np.asarray(nonzero_cols, dtype=np.int64)
     return nonzero_rows, nonzero_cols
 
 
-def _get_all_nonzero_elements_in_sc(border_matrices: Dict[int, _BorderMatrix]):
+def _get_all_nonzero_elements_in_sc(border_matrices: Dict[int, _BorderMatrix], timer: Optional[HierarchicalTimer] = None):
+
+    if timer is None:
+        timer = HierarchicalTimer()
+
+
     nested_comms = _get_nested_comms()
 
     nonzero_rows = np.zeros(0, dtype=np.int64)
     nonzero_cols = np.zeros(0, dtype=np.int64)
 
+    timer.start('border_matrix_loop')
     for ndx, mat in border_matrices.items():
         mat_nz_elements = list(itertools.product(mat.nonzero_rows, mat.nonzero_rows))
         mat_nz_rows, mat_nz_cols = tuple(zip(*mat_nz_elements))
         nonzero_rows = np.concatenate([nonzero_rows, mat_nz_rows])
         nonzero_cols = np.concatenate([nonzero_cols, mat_nz_cols])
         nonzero_rows, nonzero_cols = _combine_nonzero_elements(nonzero_rows, nonzero_cols)
+    timer.stop('border_matrix_loop')
 
+    timer.start('nested_comms_loop')
     for _comm in reversed(nested_comms):
         tmp_nz_rows_size = np.zeros(_comm.Get_size(), dtype=np.int64)
         tmp_nz_cols_size = np.zeros(_comm.Get_size(), dtype=np.int64)
@@ -109,19 +122,25 @@ def _get_all_nonzero_elements_in_sc(border_matrices: Dict[int, _BorderMatrix]):
         nz_rows_size = np.zeros(_comm.Get_size(), dtype=np.int64)
         nz_cols_size = np.zeros(_comm.Get_size(), dtype=np.int64)
 
+        timer.start('Allreduce')
         _comm.Allreduce(tmp_nz_rows_size, nz_rows_size)
         _comm.Allreduce(tmp_nz_cols_size, nz_cols_size)
+        timer.stop('Allreduce')
 
         all_nonzero_rows = np.zeros(nz_rows_size.sum(), dtype=np.int64)
         all_nonzero_cols = np.zeros(nz_cols_size.sum(), dtype=np.int64)
 
+        timer.start('Allgatherv')
         _comm.Allgatherv(nonzero_rows, [all_nonzero_rows, nz_rows_size])
         _comm.Allgatherv(nonzero_cols, [all_nonzero_cols, nz_cols_size])
-
+        timer.stop('Allgatherv')
         nonzero_rows = all_nonzero_rows
         nonzero_cols = all_nonzero_cols
 
-        nonzero_rows, nonzero_cols = _combine_nonzero_elements(nonzero_rows, nonzero_cols)
+        timer.start('combine_elements')
+        nonzero_rows, nonzero_cols = _combine_nonzero_elements(nonzero_rows, nonzero_cols, timer)
+        timer.stop('combine_elements')
+    timer.stop('nested_comms_loop')
 
     return nonzero_rows, nonzero_cols
 
@@ -238,7 +257,7 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
             self.border_matrices[ndx] = _BorderMatrix(block_matrix.get_block(self.block_dim - 1, ndx))
         timer.stop('build_border_matrices')
         timer.start('gather_all_nonzero_elements')
-        nonzero_rows, nonzero_cols = _get_all_nonzero_elements_in_sc(self.border_matrices)
+        nonzero_rows, nonzero_cols = _get_all_nonzero_elements_in_sc(self.border_matrices, timer)
         timer.stop('gather_all_nonzero_elements')
         timer.start('construct_schur_complement')
         sc_nnz = nonzero_rows.size
@@ -289,7 +308,7 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
 
         res = LinearSolverResults()
         res.status = LinearSolverStatus.successful
-        timer.start('form_SC')
+        
         for ndx in self.local_block_indices:
             timer.start('block_factorize')
             sub_res = self.subproblem_solvers[ndx].do_numeric_factorization(matrix=block_matrix.get_block(ndx, ndx),
@@ -299,6 +318,7 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
             if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
                 break
         res = _gather_results(res)
+        timer.start('form_SC')
         if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
             if raise_on_error:
                 raise RuntimeError('Numeric factorization unsuccessful; status: ' + str(res.status))

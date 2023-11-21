@@ -59,13 +59,43 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
         #self.schur_complement = coo_matrix((0, 0))
         self.border_matrices: Dict[int, _BorderMatrix] = dict()
         self.sc_data_slices = dict()
+        self.schur_complement_solver = schur_complement_solver
         self._diagnostic_flag = options['diagnostic_flag']
+
+        self._factorize_sc_strategy = options['factorize_sc_strategy']['type']
+        self._factorize_sc_flag = False
+        self._form_sc_flag = self._diagnostic_flag
+        self._use_direct_preconditioner_flag = False
+        if self._factorize_sc_strategy is not None:
+            self._factorize_sc_flag = True
+            self._form_sc_flag = True
+            self._use_direct_preconditioner_flag = True
+            def direct_preconditioner(r):
+                return self.schur_complement_solver.do_back_solve(r)
+            if self._factorize_sc_strategy == 'adaptive-mu':
+                self._prev_mu = np.nan
+                H_strategy = 'None'
+            elif self._factorize_sc_strategy == 'start':
+                self._factorize_sc_threshold = options['factorize_sc_strategy']['threshold']
+                H_strategy = 'all'
+            elif self._factorize_sc_strategy == 'adaptive':
+                self._factorize_sc_threshold = options['factorize_sc_strategy']['threshold']
+                H_strategy = 'None'
+            else:
+                raise NotImplementedError
+        else:
+            H_strategy = 'all'
+            direct_preconditioner = None
+        
+
         if options['preconditioner']['type'] == 'bfgs':
-            _preconditioner = BfgsPreqn(H_strategy='all', diagnostic_flag=self._diagnostic_flag)
+            _preconditioner = BfgsPreqn(H_strategy=H_strategy, diagnostic_flag=self._diagnostic_flag, direct_preconditioner=direct_preconditioner)
         elif options['preconditioner']['type'] == 'lbfgs':
             _preconditioner = LbfgsPreqn(memory=options['preconditioner']['memory'],
                                          strategy=options['preconditioner']['strategy'],
                                          diagnostic_flag=self._diagnostic_flag)
+        elif options['preconditioner']['type'] == None:
+            _preconditioner = PreqnNone()
         else:
             raise NotImplementedError
         
@@ -77,12 +107,10 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
                                            preconditioner=_preconditioner)
 
         self._adjust_sc_tol: bool = options['adjust_sc_tol']
-        self._sc_tol_reduction_factor = options['sc_tol_reduction_factor']
-        self._facorize_sc_flag = self._diagnostic_flag
-        self.schur_complement_solver = schur_complement_solver
-        self._factorize_sc_strategy = options['factorize_sc_strategy']
-        if self._factorize_sc_strategy == 'start':
-            self._facorize_sc_flag = True
+        if self._adjust_sc_tol:
+            self._sc_tol_reduction_factor = options['sc_tol_reduction_factor']
+        else:
+            self._sc_tol_reduction_factor = None
         self._diagnostic_info = dict()
         self._prev_coupling: NDArray = np.empty(0)
         self._initialize_pcg = options['initialize_pcg']
@@ -161,9 +189,9 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
         for ndx in self.local_block_indices:
             self.border_matrices[ndx] = _BorderMatrix(block_matrix.get_block(self.block_dim - 1, ndx))
         timer.stop('build_border_matrices')
-        if self._facorize_sc_flag:
+        if self._form_sc_flag:
             timer.start('gather_all_nonzero_elements')
-            nonzero_rows, nonzero_cols = _get_all_nonzero_elements_in_sc(self.border_matrices)
+            nonzero_rows, nonzero_cols = _get_all_nonzero_elements_in_sc(self.border_matrices, timer)
             timer.stop('gather_all_nonzero_elements')
             timer.start('construct_schur_complement')
             sc_nnz = nonzero_rows.size
@@ -228,8 +256,8 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
                 raise RuntimeError('Numeric factorization unsuccessful; status: ' + str(res.status))
             else:
                 return res
-        if self._facorize_sc_flag:
-            timer.start('form SC')
+        if self._form_sc_flag:
+            timer.start('form_SC')
             self.schur_complement.data = np.zeros(self.schur_complement.data.size, dtype=np.double)
             for ndx in self.local_block_indices:
                 border_matrix: _BorderMatrix = self.border_matrices[ndx]
@@ -268,19 +296,19 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
             sc = self.schur_complement + block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
             timer.stop('add')
             timer.stop('communicate')
-            timer.stop('form SC')
+            timer.stop('form_SC')
             #cond = np.linalg.cond(sc.toarray())
             #print(f'SC condition number: {cond}')
-
-            timer.start('factor SC')
+        if self._form_sc_flag and self._factorize_sc_flag:
+            timer.start('factor_SC')
             sub_res = self.schur_complement_solver.do_symbolic_factorization(sc, raise_on_error=raise_on_error)
             _process_sub_results(res, sub_res)
             if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
-                timer.stop('factor SC')
+                timer.stop('factor_SC')
                 return res
             sub_res = self.schur_complement_solver.do_numeric_factorization(sc)
             _process_sub_results(res, sub_res)
-            timer.stop('factor SC')
+            timer.stop('factor_SC')
         else:
             pass
 
@@ -343,10 +371,11 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
             x0 = self._prev_coupling
         else:
             x0 = None
+            
 
         timer.start('pcg')
         coupling, info = self.pcg_schur_solve(schur_complement_rhs=schur_complement_rhs, ip_iter=ip_iter,
-                                              timer=timer, tol=tol, x0=x0)
+                                              timer=timer, tol=tol, x0=x0, use_direct_preconditioner=self._use_direct_preconditioner_flag)
         timer.stop('pcg')
 
         if self._initialize_pcg:
@@ -367,18 +396,38 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
             pcg_info['eig_S'] = sc_eigs
             pcg_info['eig_HS'] = psc_eigs
             ns = rhs.size
-            pcg_info['sparsity_S'] = np.count_nonzero(sc.toarray())/(ns **2)
-            pcg_info['sparsity_HS'] = np.count_nonzero(hsc)/(ns **2)
+            pcg_info['sparsity_S'] = 1 - np.count_nonzero(sc.toarray())/(ns**2)
+            pcg_info['sparsity_H'] = 1 - np.count_nonzero(self._cg._preconditioner.H)/(ns**2)
         self._diagnostic_info[ip_iter] = pcg_info
 
-        ns = rhs.size
+        ns = coupling.size
+
         if self._factorize_sc_strategy == 'start':
-            if (not self._diagnostic_flag) and ip_iter > 0:
-                self._facorize_sc_flag = False
+            self._factorize_sc_flag = False
+            if info['n_iter'] > ns * self._factorize_sc_threshold:
+                self._use_direct_preconditioner_flag = False
         elif self._factorize_sc_strategy == 'adaptive':
-            if self._facorize_sc_flag and not self._diagnostic_flag and ip_iter > 0:
-                if info['n_iter'] < ns:
-                    self._facorize_sc_flag = False
+            if info['n_iter'] > ns * self._factorize_sc_threshold:
+                self._factorize_sc_flag = True
+            else:
+                self._factorize_sc_flag = False
+            self._use_direct_preconditioner_flag = True
+        elif self._factorize_sc_strategy == 'adaptive-mu':
+            if self._prev_mu == np.nan: #ip_iter = 0
+                self._prev_mu = barrier
+                self._factorize_sc_flag = False
+            if self._prev_mu != barrier:
+                self._factorize_sc_flag = True
+                self._prev_mu = barrier
+            else:
+                self._factorize_sc_flag = False
+            self._use_direct_preconditioner_flag = True
+        
+        if self._diagnostic_flag:
+            self._form_sc_flag = True
+        else:
+            self._form_sc_flag = self._factorize_sc_flag
+  
         # TODO: Return when negative curvature is detected
         # if self._diagnostic_flag:
         #     _coupling = self.schur_complement_solver.do_back_solve(schur_complement_rhs)
@@ -445,7 +494,7 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
             sub_solver.increase_memory_allocation(factor=factor)
 
 
-    def pcg_schur_solve(self, schur_complement_rhs, ip_iter, timer=None, tol=1e-8, x0=None):
+    def pcg_schur_solve(self, schur_complement_rhs, ip_iter, timer=None, tol=1e-8, x0=None, use_direct_preconditioner=False):
 
         if timer is None:
             timer = HierarchicalTimer()
@@ -480,7 +529,8 @@ class MPIImplicitSchurComplementLinearSolver(LinearSolverInterface):
                                         rhs=schur_complement_rhs,
                                         tol=tol,
                                         ip_iter=ip_iter,
-                                        x0=x0, timer=timer)
+                                        x0=x0, timer=timer, use_direct_preconditioner=use_direct_preconditioner)
+        
 
         return coupling, info
 
@@ -493,8 +543,7 @@ class ConjugateGradientSolver:
                  stopping_criteria: str,
                  beta_update: str,
                  beta_restart: bool,
-                 preconditioner: Preqn,
-                 direct_preconditioner: Optional[Callable] = None):
+                 preconditioner: Preqn):
         self._preconditioner = preconditioner
         if stopping_criteria == 'inf_res':
             def f_stopping_criteria(r_k, z_k, r_0, rhs):
@@ -502,6 +551,9 @@ class ConjugateGradientSolver:
         elif stopping_criteria == 'inf_rel_res':
             def f_stopping_criteria(r_k, z_k, r_0, rhs):
                 return np.max(np.abs(r_k))/np.max(np.abs(r_0))
+        elif stopping_criteria == '2_rel_res':
+            def f_stopping_criteria(r_k, z_k, r_0, rhs):
+                return np.sqrt(r_k.T.dot(r_k))/np.sqrt(r_0.T.dot(r_0))
         elif stopping_criteria == '2_rel_rhs':
             def f_stopping_criteria(r_k, z_k, r_0, rhs):
                 return np.sqrt(r_k.T.dot(r_k))/np.sqrt(rhs.T.dot(rhs))
@@ -528,7 +580,6 @@ class ConjugateGradientSolver:
 
         self._max_iter = max_iter
         self.tol = tol
-        self._direct_preconditioner = direct_preconditioner
         
     
     def solve(self,
@@ -538,6 +589,7 @@ class ConjugateGradientSolver:
               ip_iter: int,
               x0: Optional[NDArray] = None,
               timer: Optional[HierarchicalTimer] = None,
+              use_direct_preconditioner: bool = False
               ) -> Tuple[NDArray, Dict]:
         if timer is None:
             timer = HierarchicalTimer()
@@ -565,9 +617,10 @@ class ConjugateGradientSolver:
         n = rhs.size
         #norm_rhs = np.sqrt(rhs.T.dot(rhs))
         norm1 = 0
-        r0 = np.max(np.abs(r_k))
+        #r0 = np.max(np.abs(r_k))
+        r0 = r_k.copy()
         for k in range(self._max_iter):
-            if self._beta_update == 'FR':
+            if self._beta_update == 'PR':
                 z_k_prev = z_k.copy()
             # TODO: See if this makes sense generally - intermittently factorizing S - incorporate into preqn?
             # if ip_iter > -1:
@@ -576,14 +629,10 @@ class ConjugateGradientSolver:
             #     zz_k = self._preconditioner.preqn(ip_iter, k, r_k, d_k, w_k)
             #     z_k = self._tmp_precond(r_k)
             timer.start('precondition')
-            z_k = self._preconditioner.preqn(ip_iter, k, r_k, d_k, w_k, timer)
+            z_k = self._preconditioner.preqn(ip_iter, k, r_k, d_k, w_k, timer, use_direct_preconditioner)
             timer.stop('precondition')
             norm2 = norm1
             norm1 = r_k.T.dot(z_k)
-            # TODO: Decide on stopping criteria
-            # alternative: ||r||/||b|| < tol
-            #if np.sqrt(z_k.T.dot(z_k)) < tol:
-            #residuals.append(np.sqrt(r_k.T.dot(z_k))/norm_rhs)
             res = self._compute_merit(r_k, z_k, r0, rhs)
             residuals.append(res)
             if res < tol:
@@ -594,9 +643,7 @@ class ConjugateGradientSolver:
                     beta = self._compute_beta_update(norm1, norm2, r_k, z_k_prev)
                 else:
                     beta = 0
-                beta = norm1 / norm2 
-                
-                #beta = (norm1 - r_k.T.dot(z_k_prev))/norm2
+
                 d_k = - z_k + beta * d_k
             else:
                 d_k = -z_k
@@ -607,16 +654,26 @@ class ConjugateGradientSolver:
             denom = d_k.T.dot(w_k)
             if denom <= 0:
                 status = 2
-                print('WARNING: Schur complement has negative or zero eigenvalues. (PCG)')
+                if rank == 0:
+                    print(f'WARNING: PCG: Schur complement has negative or zero eigenvalues (badness: {denom}).')
+                info['residuals'] = np.array(residuals)
+                info['status'] = status
+                info['n_iter'] = k + 1
+                return x_k, info
             
             alpha_k = norm1 / denom
             x_k += alpha_k * d_k
             # Recomputing Residual - can help with roundoff
-            if np.mod(k, n) != 0:
+            if np.mod(k, 50) != 0:
                 r_k += alpha_k * w_k
             else:
                 r_k = linear_operator(x_k) - rhs
             #r_k += alpha_k * w_k
+
+        if res >= tol:
+            status = 1
+            if rank == 0:
+                print(f'WARNING: PCG: Maximum iterations exceeded. Residual: {res}.')
 
         info['residuals'] = np.array(residuals)
         info['status'] = status
@@ -627,22 +684,35 @@ class ConjugateGradientSolver:
 
 class Preqn:
     H: NDArray
+    _direct_preconditioner: Optional[Callable] = None
 
     def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray,
-           timer: Optional[HierarchicalTimer] = None):
+           timer: Optional[HierarchicalTimer] = None, use_direct_preconditioner: bool = False):
         raise NotImplementedError
+
+class PreqnNone(Preqn):
+
+    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray,
+           timer: Optional[HierarchicalTimer] = None, use_direct_preconditioner: bool = False):
+        if ip_iter == 0 and cg_iter == 0:
+            n = residual.size
+            self.H = np.eye(n)
+        return residual
+
 
 class BfgsPreqn(Preqn):
 
     def __init__(self, H_strategy: str = 'all',
-                 diagnostic_flag: bool = False):
+                 diagnostic_flag: bool = False,
+                 direct_preconditioner: Optional[Callable] = None):
         self._H_strategy: str = H_strategy
         self._diagnostic_flag: bool = diagnostic_flag
         self.H: NDArray = np.empty(())
         self.H_prev: NDArray = np.empty(())
+        self._direct_preconditioner: Callable = direct_preconditioner
 
     def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray,
-           timer: Optional[HierarchicalTimer] = None):
+           timer: Optional[HierarchicalTimer] = None, use_direct_preconditioner: bool = False):
         if timer is None:
             timer = HierarchicalTimer()
         n = residual.size
@@ -655,22 +725,29 @@ class BfgsPreqn(Preqn):
                 vv = (np.eye(n) - rho * y.dot(s.T))
                 self.H = vv.T @ self.H @ vv + rho * s.dot(s.T)
                 timer.stop('form_H')
+            elif self._H_strategy == 'None':
+                pass
             else:
                 raise NotImplementedError
 
         if ip_iter == 0:
             # no preconditioning
             self.H  = np.eye(n)
-            if self._diagnostic_flag:
-                self.H_prev = np.eye(n)
-            return residual
+            if not use_direct_preconditioner:
+                return residual
+
         elif cg_iter == 0:
-            self.H_prev = self.H
+            self.H_prev = self.H.copy()
             #self.H = np.eye(n)
         
-        timer.start('precond_matvec')
-        r = self.H_prev.dot(residual)
-        timer.stop('precond_matvec')
+        if not use_direct_preconditioner:
+            timer.start('precond_matvec')
+            r = self.H_prev.dot(residual)
+            timer.stop('precond_matvec')
+        else:
+            timer.start('SC_back_solve')
+            r = self._direct_preconditioner(residual)
+            timer.stop('SC_back_solve')
 
         return r
 
@@ -696,6 +773,11 @@ class LbfgsPreqn(Preqn):
             #self._k_indxs = np.zeros((self._mem_len/2))
             self._l = np.arange(1, (self._mem_len/2) + 1)
             self._k_indxs = []
+            self._last_s_store = np.empty(())
+            self._last_y_store = np.empty(())
+            self._last_rho_store = np.nan
+        if self._strategy == 'rayleigh':
+            self._quotients = []
 
     def _uniform_sample(self, k: int):
         k_indxs = ((self._mem_len/2) + self._l - 1) * (2 ** self._cycle)
@@ -713,7 +795,7 @@ class LbfgsPreqn(Preqn):
 
 
     def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray,
-           timer: Optional[HierarchicalTimer] = None):
+           timer: Optional[HierarchicalTimer] = None, use_direct_preconditioner: bool = False):
         if timer is None:
             timer = HierarchicalTimer()
         n = residual.size
@@ -746,6 +828,29 @@ class LbfgsPreqn(Preqn):
                         self._S_STORE_NXT.append(d_k.reshape(-1,1))
                         self._RHO_STORE_NXT.append(1.0/(w_k.T.dot(d_k)))
 
+                        self._last_y_store = np.empty(())
+                        self._last_s_store = np.empty(())
+                        self._last_rho_store = np.nan
+                    else:
+                        self._last_y_store = w_k.reshape(-1,1)
+                        self._last_s_store = d_k.reshape(-1,1)
+                        self._last_rho_store = 1.0/(w_k.T.dot(d_k))
+            elif self._strategy == 'rayleigh':
+                if len(self._Y_STORE_NXT) < self._mem_len:
+                    self._Y_STORE_NXT.append(w_k.reshape(-1,1))
+                    self._S_STORE_NXT.append(d_k.reshape(-1,1))
+                    self._RHO_STORE_NXT.append(1.0/(w_k.T.dot(d_k)))
+                    self._quotients.append(d_k.T.dot(w_k)/(d_k.T.dot(d_k)))
+                else:
+                    q = d_k.T.dot(w_k)/(d_k.T.dot(d_k))
+                    min_q = np.min(self._quotients)
+                    if q < min_q:
+                        max_q_idx = np.argmax(self._quotients)
+                        self._Y_STORE_NXT[max_q_idx] = w_k.reshape(-1,1)
+                        self._S_STORE_NXT[max_q_idx] = d_k.reshape(-1,1)
+                        self._RHO_STORE_NXT[max_q_idx] = 1.0/(w_k.T.dot(d_k))
+                        self._quotients[max_q_idx] = q
+
         if ip_iter == 0:
             # no preconditioning
             if self._diagnostic_flag:
@@ -753,10 +858,22 @@ class LbfgsPreqn(Preqn):
             return residual
         elif cg_iter == 0:
             if len(self._Y_STORE_NXT) > 0:
+                if self._strategy == 'rayleigh':
+                    self._quotients.clear()
+                if self._strategy == 'uniform':
+                    if self._last_rho_store is not np.nan:
+                        self._Y_STORE_NXT.append(self._last_y_store)
+                        self._S_STORE_NXT.append(self._last_s_store)
+                        self._RHO_STORE_NXT.append(self._last_rho_store)
+                self._Y_STORE.clear()
+                self._S_STORE.clear()
+                self._RHO_STORE.clear()
+
                 for _ in range(len(self._Y_STORE_NXT)):
-                    self._Y_STORE.append(self._Y_STORE_NXT.pop())
-                    self._S_STORE.append(self._S_STORE_NXT.pop())
-                    self._RHO_STORE.append(self._RHO_STORE_NXT.pop())
+                    self._Y_STORE.append(self._Y_STORE_NXT.popleft())
+                    self._S_STORE.append(self._S_STORE_NXT.popleft())
+                    self._RHO_STORE.append(self._RHO_STORE_NXT.popleft())
+   
                 #debug
                 if self._diagnostic_flag:
                     timer.start('form H')
@@ -786,6 +903,7 @@ class LbfgsPreqn(Preqn):
         # compute z = M^{-1} r
         timer.start('precond_matvec')
         r2 = self._precond_mv(residual)
+        #r2 = self.H @ residual
         timer.stop('precond_matvec')
         return r2
     
@@ -794,13 +912,13 @@ class LbfgsPreqn(Preqn):
         n = u.size
         bound: int = len(self._RHO_STORE)
         alphas = np.zeros(bound)
-        for i in reversed(range(bound)):
+        for i in reversed(range(1,bound)):
             alphas[i] = self._RHO_STORE[i] * self._S_STORE[i].T.dot(q)
             q -= alphas[i] * self._Y_STORE[i].flatten()
 
         gamma: NDArray = (self._S_STORE[bound-1].T.dot(self._Y_STORE[bound-1])/self._Y_STORE[bound-1].T.dot(self._Y_STORE[bound-1]))
         r =  gamma.reshape(()) * q
-        for i in range(0, bound):
+        for i in range(1, bound):
             beta = self._RHO_STORE[i] * self._Y_STORE[i].T.dot(r)
             r += self._S_STORE[i].flatten() * (alphas[i] - beta)
         
