@@ -5,9 +5,11 @@ from scipy.sparse import coo_matrix, tril
 import parapint
 import pytest
 from pyomo.contrib.pynumero.linalg.ma27 import MA27Interface
+from parapint.linalg.mkl_pardiso import MKLPardisoInterface
 
 ma27_available = MA27Interface.available()
 mumps, mumps_available = attempt_import('mumps')
+mkl_pardiso_available = MKLPardisoInterface.available()
 
 
 def get_base_matrix(use_tril):
@@ -98,6 +100,12 @@ class TestLinearSolvers(unittest.TestCase):
         solver = parapint.linalg.InteriorPointMA27Interface()
         self._test_linear_solvers(solver)
 
+    @pytest.mark.serial
+    @pytest.mark.fast
+    @unittest.skipIf(not mkl_pardiso_available, 'MKL Pardiso is needed for interior point tests')
+    def test_mkl_pardiso(self):
+        solver = parapint.linalg.InteriorPointMKLPardisoInterface()
+        self._test_linear_solvers(solver)
 
 @unittest.skip('This does not work yet')
 class TestWrongNonzeroOrdering(unittest.TestCase):
@@ -130,3 +138,8 @@ class TestWrongNonzeroOrdering(unittest.TestCase):
     def test_ma27(self):
         solver = parapint.linalg.InteriorPointMA27Interface()
         self._test_solvers(solver, use_tril=True)
+
+
+if __name__ == '__main__':
+    #
+    unittest.main()
