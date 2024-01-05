@@ -2,3 +2,5 @@
 parapint.egg-info
 __pycache__
 *cover*
+build
+dist

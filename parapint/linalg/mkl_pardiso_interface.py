@@ -27,6 +27,8 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
         self._num_status = None
         if not isspmatrix_csr(matrix):
             matrix = matrix.tocsr()
+        if not matrix.has_sorted_indices:
+            matrix.sort_indices()
         nrows, ncols = matrix.shape
         if nrows != ncols:
             raise ValueError("Matrix must be square")
@@ -55,6 +57,8 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
     ) -> LinearSolverResults:
         if not isspmatrix_csr(matrix):
             matrix = matrix.tocsr()
+        if not matrix.has_sorted_indices:
+            matrix.sort_indices()
         nrows, ncols = matrix.shape
         if nrows != ncols:
             raise ValueError("Matrix must be square")
@@ -84,6 +88,21 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
         self._num_status = res.status
 
         return res
+    
+    def increase_memory_allocation(self, factor):
+        """
+        Increas the memory allocation for factorization. This method should only be called
+        if the results status from do_symbolic_factorization or do_numeric_factorization is
+        LinearSolverStatus.not_enough_memory.
+
+        Parameters
+        ----------
+        factor: float
+            The factor by which to increase memory allocation. Should be greater than 1.
+        """
+        # TODO: Determine how to allocate memory using pardiso
+        #self._pardiso._mem_factor = factor
+        pass
 
     def do_back_solve(
         self, rhs: Union[np.ndarray, BlockVector], raise_on_error: bool = True
@@ -108,10 +127,6 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
 
         return result
 
-    # def increase_memory_allocation(self, factor):
-    #     self._pardiso.iw_factor *= factor
-    #     self._pardiso.a_factor *= factor
-
     def set_iparm(self, key, value):
         self._pardiso.set_iparm(key, value)
 
@@ -123,6 +138,6 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
             raise RuntimeError('Must call do_numeric_factorization before inertia can be computed')
         if self._num_status != LinearSolverStatus.successful:
             raise RuntimeError('Can only compute inertia if the numeric factorization was successful.')
-        num_negative_eigenvalues = self.get_iparm(24)
-        num_positive_eigenvalues = self.get_iparm(23)
+        num_negative_eigenvalues = self.get_iparm(23)
+        num_positive_eigenvalues = self.get_iparm(22)
         return (num_positive_eigenvalues, num_negative_eigenvalues, 0)
