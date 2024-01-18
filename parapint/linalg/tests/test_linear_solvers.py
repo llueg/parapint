@@ -100,7 +100,6 @@ class TestLinearSolvers(unittest.TestCase):
         solver = parapint.linalg.ScipyInterface(compute_inertia=True)
         self._test_linear_solvers(solver)
         self._test_inertia_computation(solver)
-        print('Passed Scipy')
 
     @pytest.mark.serial
     @pytest.mark.fast
@@ -117,7 +116,6 @@ class TestLinearSolvers(unittest.TestCase):
         solver = parapint.linalg.InteriorPointMA27Interface()
         self._test_linear_solvers(solver)
         self._test_inertia_computation(solver)
-        print('Passed MA27')
 
     @pytest.mark.serial
     @pytest.mark.fast
@@ -127,10 +125,6 @@ class TestLinearSolvers(unittest.TestCase):
         solver = parapint.linalg.InteriorPointMKLPardisoInterface()
         self._test_linear_solvers(solver)
         self._test_inertia_computation(solver)
-        print('Passed Pardiso')
-        del solver._pardiso
-        del solver
-        tmp = 0
 
 @unittest.skip('This does not work yet')
 class TestWrongNonzeroOrdering(unittest.TestCase):
