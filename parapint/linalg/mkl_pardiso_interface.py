@@ -1,7 +1,8 @@
 from .base_linear_solver_interface import LinearSolverInterface
 from .results import LinearSolverStatus, LinearSolverResults
 from .mkl_pardiso import MKLPardisoInterface
-from scipy.sparse import isspmatrix_coo, isspmatrix_csr, tril, spmatrix
+import scipy.sparse as sps
+from scipy.sparse import isspmatrix_coo, isspmatrix_csr, tril, triu, spmatrix
 from pyomo.contrib.pynumero.sparse import BlockVector, BlockMatrix
 from pyomo.common.timing import HierarchicalTimer
 from typing import Union, Tuple, Optional
@@ -20,21 +21,56 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
     @classmethod
     def getLoggerName(cls):
         return 'mkl_pardiso'
+    
+    def _convert_matrix(self, matrix: Union[spmatrix, BlockMatrix]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        # TODO: This can be optimized
+        # if isinstance(matrix, BlockMatrix):
+        #     dmat = sps.csr_matrix(np.triu(matrix.toarray()))
+        # else:
+        #     dmat = sps.csr_matrix(triu(matrix))
+        # dmat.sort_indices()
+        if isinstance(matrix, BlockMatrix):
+            smat = sps.csr_matrix(np.triu(matrix.toarray()))
+            # dmat = smat.todense()
+            # zero_diag_idx = np.where(dmat.diagonal() == 0)[1]
+            # diag_perturb = np.zeros(dmat.shape[0])
+            # diag_perturb[zero_diag_idx] = 1
+            # dmat2 = dmat + diag_perturb
+            # smat2 = sps.csr_matrix(dmat2)
+            # a2, ia2, ja2 = smat2.data, smat2.indptr, smat2.indices
+            # a2[ia2[zero_diag_idx]] = 0
+            #dmat = sps.csr_matrix((a2, ja2, ia2))
+
+        else:
+            smat = sps.csr_matrix(triu(matrix))
+        dmat = smat.todense()
+        zero_diag_idx = np.where(dmat.diagonal() == 0)[1]
+        diag_perturb = np.zeros(dmat.shape[0])
+        diag_perturb[zero_diag_idx] = 1
+        dmat2 = dmat + np.diag(diag_perturb)
+        smat2 = sps.csr_matrix(dmat2).sorted_indices()
+        a2, ia2, ja2 = smat2.data, smat2.indptr, smat2.indices
+        a2[ia2[zero_diag_idx]] = 0
+            #dmat = sps.csr_matrix((a2, ja2, ia2))
+
+        #dmat.sort_indices()
+        #_orig_dia = dmat.diagonal()
+        #dmat.setdiag(1)
+
+        return a2, ia2 + 1, ja2 + 1
 
     def do_symbolic_factorization(
         self, matrix: Union[spmatrix, BlockMatrix], raise_on_error: bool = True
     ) -> LinearSolverResults:
         self._num_status = None
-        if not isspmatrix_csr(matrix):
-            matrix = matrix.tocsr()
-        if not matrix.has_sorted_indices:
-            matrix.sort_indices()
         nrows, ncols = matrix.shape
         if nrows != ncols:
             raise ValueError("Matrix must be square")
         self._dim = nrows
 
-        stat = self._pardiso.do_symbolic_factorization(a=matrix.data, ia=matrix.indptr + 1, ja=matrix.indices + 1)
+        _a, _ia, _ja = self._convert_matrix(matrix)
+
+        stat = self._pardiso.do_symbolic_factorization(a=_a, ia=_ia, ja=_ja)
         res = LinearSolverResults()
         if stat == 0:
             res.status = LinearSolverStatus.successful
@@ -55,10 +91,6 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
     def do_numeric_factorization(
         self, matrix: Union[spmatrix, BlockMatrix], raise_on_error: bool = True
     ) -> LinearSolverResults:
-        if not isspmatrix_csr(matrix):
-            matrix = matrix.tocsr()
-        if not matrix.has_sorted_indices:
-            matrix.sort_indices()
         nrows, ncols = matrix.shape
         if nrows != ncols:
             raise ValueError("Matrix must be square")
@@ -67,8 +99,8 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
                 "Matrix dimensions do not match the dimensions of "
                 "the matrix used for symbolic factorization"
             )
-
-        stat = self._pardiso.do_numeric_factorization(a=matrix.data, ia=matrix.indptr + 1, ja=matrix.indices + 1)
+        _a, _ia, _ja = self._convert_matrix(matrix)
+        stat = self._pardiso.do_numeric_factorization(a=_a, ia=_ia, ja=_ja)
         res = LinearSolverResults()
         if stat == 0:
             res.status = LinearSolverStatus.successful
