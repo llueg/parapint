@@ -67,6 +67,38 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
             else:
                 res.status = LinearSolverStatus.error
         return res
+    
+    def do_symbolic_factorization_schur(
+        self, matrix: Union[spmatrix, BlockMatrix], dim_schur: int, raise_on_error: bool = True
+    ) -> Tuple[LinearSolverResults, int]:
+        self._num_status = None
+        nrows, ncols = matrix.shape
+        if nrows != ncols:
+            raise ValueError("Matrix must be square")
+        self._dim = nrows
+
+        _a, _ia, _ja = self._convert_matrix(matrix)
+
+        stat = self._pardiso.do_symbolic_factorization_schur(a=_a, ia=_ia, ja=_ja, dim_schur=dim_schur)
+        
+        res = LinearSolverResults()
+        if stat == 0:
+            res.status = LinearSolverStatus.successful
+        else:
+            if raise_on_error:
+                raise RuntimeError(
+                    "Symbolic factorization was not successful; return code: "
+                    + str(stat)
+                )
+            if stat in {-2}:
+                res.status = LinearSolverStatus.not_enough_memory
+            elif stat in {-7}:
+                res.status = LinearSolverStatus.singular
+            else:
+                res.status = LinearSolverStatus.error
+
+        schur_nnz = self._pardiso._sc_nnz
+        return res, schur_nnz
 
     def do_numeric_factorization(
         self, matrix: Union[spmatrix, BlockMatrix], raise_on_error: bool = True
@@ -101,6 +133,40 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
 
         return res
     
+    def do_numeric_factorization_schur(
+        self, matrix: Union[spmatrix, BlockMatrix], raise_on_error: bool = True
+    ) -> Tuple[LinearSolverResults, sps.csr_matrix]:
+        nrows, ncols = matrix.shape
+        if nrows != ncols:
+            raise ValueError("Matrix must be square")
+        if nrows != self._dim:
+            raise ValueError(
+                "Matrix dimensions do not match the dimensions of "
+                "the matrix used for symbolic factorization"
+            )
+        _a, _ia, _ja = self._convert_matrix(matrix)
+        stat = self._pardiso.do_numeric_factorization_schur(a=_a, ia=_ia, ja=_ja)
+        res = LinearSolverResults()
+        if stat == 0:
+            res.status = LinearSolverStatus.successful
+        else:
+            if raise_on_error:
+                raise RuntimeError(
+                    "Numeric factorization was not successful; return code: "
+                    + str(stat)
+                )
+            if stat in {-2}:
+                res.status = LinearSolverStatus.not_enough_memory
+            elif stat in {-7}:
+                res.status = LinearSolverStatus.singular
+            else:
+                res.status = LinearSolverStatus.error
+
+        self._num_status = res.status
+        sc: sps.csr_matrix = self._pardiso._sc
+
+        return res, sc
+    
     def increase_memory_allocation(self, factor):
         # TODO: No direct equivalent in Pardiso
         print("WARNING: increase_memory_allocation not implemented for MKL Pardiso")
@@ -127,6 +193,29 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
             result = _result
 
         return result
+    
+    def do_back_solve_schur(
+        self, rhs: Union[np.ndarray, BlockVector], raise_on_error: bool = True
+    ) -> Tuple[Optional[Union[np.ndarray, BlockVector]], LinearSolverResults]:
+        if self._num_status is None:
+            raise RuntimeError('Must call do_numeric_factorization before do_back_solve can be called')
+        if self._num_status != LinearSolverStatus.successful:
+            raise RuntimeError('Can only call do_back_solve if the numeric factorization was successful.')
+        
+        if isinstance(rhs, BlockVector):
+            _rhs = rhs.flatten()
+            result = _rhs
+        else:
+            result = rhs.copy()
+
+        result = self._pardiso.do_backsolve_schur(result, copy=False)
+
+        if isinstance(rhs, BlockVector):
+            _result = rhs.copy_structure()
+            _result.copyfrom(result)
+            result = _result
+
+        return result
 
     def set_iparm(self, key, value):
         self._pardiso.set_iparm(key, value)
@@ -142,3 +231,5 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
         num_negative_eigenvalues = self.get_iparm(23)
         num_positive_eigenvalues = self.get_iparm(22)
         return (num_positive_eigenvalues, num_negative_eigenvalues, 0)
+    
+

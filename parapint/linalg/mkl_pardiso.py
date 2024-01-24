@@ -269,7 +269,7 @@ class MKLPardisoInterface(object):
 
         return self._error
     
-    def _do_backsolve_schur(self, rhs, copy=True):
+    def do_backsolve_schur(self, rhs, copy=True):
         # After factorization of 
         # [A   B]
         # [B^T D],
