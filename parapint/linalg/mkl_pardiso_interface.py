@@ -22,27 +22,13 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
     def getLoggerName(cls):
         return 'mkl_pardiso'
     
-    def _convert_matrix(self, matrix: Union[spmatrix, BlockMatrix]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # TODO: This can be optimized
-        # if isinstance(matrix, BlockMatrix):
-        #     dmat = sps.csr_matrix(np.triu(matrix.toarray()))
-        # else:
-        #     dmat = sps.csr_matrix(triu(matrix))
-        # dmat.sort_indices()
+    def _convert_matrix(self, matrix: Union[spmatrix, BlockMatrix]
+                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if isinstance(matrix, BlockMatrix):
             smat = sps.csr_matrix(np.triu(matrix.toarray()))
-            # dmat = smat.todense()
-            # zero_diag_idx = np.where(dmat.diagonal() == 0)[1]
-            # diag_perturb = np.zeros(dmat.shape[0])
-            # diag_perturb[zero_diag_idx] = 1
-            # dmat2 = dmat + diag_perturb
-            # smat2 = sps.csr_matrix(dmat2)
-            # a2, ia2, ja2 = smat2.data, smat2.indptr, smat2.indices
-            # a2[ia2[zero_diag_idx]] = 0
-            #dmat = sps.csr_matrix((a2, ja2, ia2))
-
         else:
             smat = sps.csr_matrix(triu(matrix))
+        # TODO: This can be optimized
         dmat = smat.todense()
         zero_diag_idx = np.where(dmat.diagonal() == 0)[1]
         diag_perturb = np.zeros(dmat.shape[0])
@@ -51,12 +37,6 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
         smat2 = sps.csr_matrix(dmat2).sorted_indices()
         a2, ia2, ja2 = smat2.data, smat2.indptr, smat2.indices
         a2[ia2[zero_diag_idx]] = 0
-            #dmat = sps.csr_matrix((a2, ja2, ia2))
-
-        #dmat.sort_indices()
-        #_orig_dia = dmat.diagonal()
-        #dmat.setdiag(1)
-
         return a2, ia2 + 1, ja2 + 1
 
     def do_symbolic_factorization(
@@ -122,19 +102,8 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
         return res
     
     def increase_memory_allocation(self, factor):
-        """
-        Increas the memory allocation for factorization. This method should only be called
-        if the results status from do_symbolic_factorization or do_numeric_factorization is
-        LinearSolverStatus.not_enough_memory.
-
-        Parameters
-        ----------
-        factor: float
-            The factor by which to increase memory allocation. Should be greater than 1.
-        """
-        # TODO: Determine how to allocate memory using pardiso
-        #self._pardiso._mem_factor = factor
-        pass
+        # TODO: No direct equivalent in Pardiso
+        print("WARNING: increase_memory_allocation not implemented for MKL Pardiso")
 
     def do_back_solve(
         self, rhs: Union[np.ndarray, BlockVector], raise_on_error: bool = True

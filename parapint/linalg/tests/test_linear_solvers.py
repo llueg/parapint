@@ -1,6 +1,7 @@
 import unittest
 from pyomo.common.dependencies import attempt_import
 import numpy as np
+import scipy.sparse as sps
 from scipy.sparse import coo_matrix, tril
 import parapint
 import pytest
@@ -38,6 +39,30 @@ def get_base_matrix_wrong_order(use_tril):
     mat = coo_matrix((data, (row, col)), shape=(3,3), dtype=np.double)
     return mat
 
+def get_schur_complement_matrices(use_tril):
+    # define invertible matrix with structure
+    # [A   B]
+    # [B^T D]
+    # and return the Schur complement
+    nh = 10
+    m = 5
+    H = sps.random(nh, nh, density=0.3, random_state=0)
+    H = H + H.T + 10 * np.eye(nh)
+    B = sps.random(nh, m, density=0.3, random_state=0)
+    A = np.zeros((nh + m, nh + m))
+    D = 0.1 * np.eye(m)
+    A[:nh, :nh] = H
+    A[:nh, nh:] = B.todense()
+    A[nh:, :nh] = B.todense().T
+    A[nh:, nh:] = D
+    
+    S = D - B.T @ np.linalg.inv(H) @ B
+    if use_tril:
+        A = np.tril(A)
+    full_mat = coo_matrix(A)
+    H_mat = coo_matrix(H)
+    S_mat = coo_matrix(S)
+    return full_mat, H_mat, S_mat
 
 class TestTrilBehavior(unittest.TestCase):
     """
@@ -66,6 +91,8 @@ class TestTrilBehavior(unittest.TestCase):
 class TestLinearSolvers(unittest.TestCase):
     def _test_linear_solvers(self, solver):
         mat = get_base_matrix(use_tril=False)
+        # Note: As of now, MKL Pardiso needs filled matrix even for symbolic factorization,
+        # as zero diagonal elements are not allowed.
         #zero_mat = mat.copy()
         #zero_mat.data.fill(0)
         stat = solver.do_symbolic_factorization(mat)

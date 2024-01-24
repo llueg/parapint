@@ -1,13 +1,3 @@
-#  ___________________________________________________________________________
-#
-#  Pyomo: Python Optimization Modeling Objects
-#  Copyright (c) 2008-2022
-#  National Technology and Engineering Solutions of Sandia, LLC
-#  Under the terms of Contract DE-NA0003525 with National Technology and
-#  Engineering Solutions of Sandia, LLC, the U.S. Government retains certain
-#  rights in this software.
-#  This software is distributed under the 3-clause BSD License.
-#  ___________________________________________________________________________
 from pyomo.common.fileutils import find_library
 from pyomo.contrib.pynumero.linalg.utils import validate_index, validate_value, _NotSet
 import numpy.ctypeslib as npct
@@ -47,24 +37,21 @@ class MKLPardisoInterface(object):
         # TODO: Consistent choice array_1d_int ot pointer(INT_TYPE), etc.
         #self.lib.pardiso.restype = ctypes.c_void_p
         self.lib.pardiso.restype = None
-        self.lib.pardiso.argtypes = [ctypes.POINTER(PT_INT_TYPE),      # pt
+        self.lib.pardiso.argtypes = [ctypes.POINTER(PT_INT_TYPE),   # pt
                                      ctypes.POINTER(INT_TYPE),      # maxfct
                                      ctypes.POINTER(INT_TYPE),      # mnum
                                      ctypes.POINTER(INT_TYPE),      # mtype
                                      ctypes.POINTER(INT_TYPE),      # phase
                                      ctypes.POINTER(INT_TYPE),      # n
-                                     ctypes.POINTER(None),                # a
-                                     #array_1d_double,                     # a 
+                                     ctypes.POINTER(None),          # a
                                      ctypes.POINTER(INT_TYPE),      # ia
                                      ctypes.POINTER(INT_TYPE),      # ja
                                      ctypes.POINTER(INT_TYPE),      # perm
                                      ctypes.POINTER(INT_TYPE),      # nrhs
                                      ctypes.POINTER(INT_TYPE),      # iparm
                                      ctypes.POINTER(INT_TYPE),      # msglvl
-                                     ctypes.POINTER(None),                # b
-                                     #array_1d_double,                     # b
-                                     ctypes.POINTER(None),                # x
-                                    # array_1d_double,                     # x
+                                     ctypes.POINTER(None),          # b
+                                     ctypes.POINTER(None),          # x
                                      ctypes.POINTER(INT_TYPE)]      # error
         
         self.lib.pardiso_export.restype = None
@@ -95,15 +82,12 @@ class MKLPardisoInterface(object):
         self._perm = np.zeros(0, dtype=NP_INT_TYPE)
         # Constant parameters
         self._nrhs = 1
-        self._msglvl = 1
+        self._msglvl = 0
         # Variable input
         self._b = np.zeros(0, dtype=np.double)
         self._x = np.zeros(0, dtype=np.double)
         # Info
         self._error = 0
-
-        # Memory Limit
-        self._mem_factor = None
 
         # SC variables
         self._sc_dim: int = -1
@@ -124,7 +108,6 @@ class MKLPardisoInterface(object):
                             ctypes.byref(INT_TYPE(self._phase)),
                             ctypes.byref(INT_TYPE(self._dim)),
                             self._a.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                            #self._a,
                             self._ia.ctypes.data_as(ctypes.POINTER(INT_TYPE)),
                             self._ja.ctypes.data_as(ctypes.POINTER(INT_TYPE)),
                             self._perm.ctypes.data_as(ctypes.POINTER(INT_TYPE)),
@@ -154,12 +137,9 @@ class MKLPardisoInterface(object):
     def set_iparm(self, i, val):
         validate_index(i, 64, 'iparm')
         validate_value(i, int, 'iparm')
-        # NOTE: Use the FORTRAN indexing (same as documentation) to
-        # set and access info/cntl arrays from Python, whereas C
-        # functions use C indexing. Maybe this is too confusing.
+        # NOTE: Use the FORTRAN indexing (documentation: https://www.intel.com/content/www/us/en/docs/onemkl/developer-reference-fortran/2024-0/overview.html)
+        # to set iparm values. Internally, the 0-based indexing is used.
         self._iparm[i - 1] = val
-        # TODO: Might be too defesive
-        #if val != 0: self._iparm[0] = 1
 
     def get_iparm(self, i):
         validate_index(i, 64, 'iparm')
@@ -218,7 +198,7 @@ class MKLPardisoInterface(object):
         self._x = np.zeros_like(self._b)
 
         self._call_pardiso()
-        #return npct.as_array(b, shape=(dim,))
+
         return self._x
     
 
@@ -242,7 +222,6 @@ class MKLPardisoInterface(object):
         self._iparm[10] = 0
         self._iparm[12] = 0
         self._iparm[23] = 1
-
 
         self._call_pardiso()
 
@@ -281,8 +260,6 @@ class MKLPardisoInterface(object):
         self._sc_step = 1
 
         self._call_pardiso_export()
-        print('export done')
-
 
         self._phase = 22
         self._a = a
@@ -293,54 +270,16 @@ class MKLPardisoInterface(object):
         return self._error
     
     def _do_backsolve_schur(self, rhs, copy=True):
-        #    // solving phase
-        # /* pardiso from mkl does not support same functionality as pardiso-project
-        #     *
-        #     * pardiso project:
-        #     * when computing the schur complement S with factorization matrices we will get
-        #     *
-        #     * [A11 A12]   [L11 0] [I 0] [U11 U12]
-        #     * [A21 A22] = [L12 I] [0 S] [0     I]
-        #     *
-        #     * a subsequent solve call will then only solve for A11 x1 = b1 instead of the full
-        #     * system.
-        #     *
-        #     * pardiso mkl:
-        #     * while the schur complement is the same, the factorization computed, stored and
-        #     * used for solve calls is a full factorization. thus pardiso from intel will always
-        #     * solve the full system
-        #     *
-        #     * workaround is to solve
-        #     *
-        #     * (phase 331)
-        #     * [L11   0] [z1] = [b1]
-        #     * [L12   I] [z2] = [b2]
-        #     *
-        #     * (phase 332)
-        #     * [I 0] [y1]   [z1]
-        #     * [0 S] [y2] = [z2]
-        #     *
-        #     * (phase 333)
-        #     * [U11 U12] [x1]   [y1]
-        #     * [0     I] [x2] = [0]
-        #     *
-        #     */
-        # double* z_n = new double[nvec_size];
-        # assert(iparm[7] == 0);
-        # assert(iparm[35] = -2);
+        # After factorization of 
+        # [A   B]
+        # [B^T D],
+        # This function solves A x = rhs
+        # Followed steps from PIPS-IPM C interface, see
+        # https://github.com/NCKempke/PIPS-IPMpp/blob/pipsipm/PIPS-IPM/Core/LinearSolvers/PardisoSolver/PardisoSchurSolver/PardisoMKLSchurSolver.C
 
-        # // this is necessary for usage of stage = 331/332/333
-        # iparm[9] = 0;
-
-        # // HACK: keeping iparm[35] = -2 will, for some reason, not compute the correct result
-        # // iparm[35] will be set to -2 after stage 333
-        # iparm[35] = 2;
-
-        # phase = 331;
-        # pardiso(pt, &maxfct, &mnum, &mtype, &phase, &n, eltsAug, rowptrAug, colidxAug, nullptr, &nrhs, iparm, &msglvl, rhs_n, z_n, &error);
-        # assert(error == 0);
-
-        assert rhs.size == self._dim - self._sc_dim
+        assert rhs.size == self._dim - self._sc_dim, (
+            ' Dimension of rhs does not match diemnsion of upper left block in factorized matrix.'
+        )
 
         self._iparm[7] = 0
         self._iparm[9] = 0
