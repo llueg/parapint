@@ -11,4 +11,4 @@ class LinearSolverStatus(enum.Enum):
 
 class LinearSolverResults(object):
     def __init__(self):
-        self.status = None
+        self.status: LinearSolverStatus = None

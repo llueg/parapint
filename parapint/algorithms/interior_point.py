@@ -3,7 +3,9 @@ import numpy as np
 import logging
 import time
 from parapint.linalg.results import LinearSolverStatus
+from parapint.utils import MPIHierarchicalTimer
 from pyomo.common.timing import HierarchicalTimer
+from mpi4py import MPI
 import enum
 from parapint.interfaces.interface import BaseInteriorPointInterface
 from parapint.linalg.base_linear_solver_interface import LinearSolverInterface
@@ -22,6 +24,10 @@ Interface Requirements
 
 
 logger = logging.getLogger(__name__)
+
+comm: MPI.Comm = MPI.COMM_WORLD
+rank: int = comm.Get_rank()
+size: int = comm.Get_size()
 
 
 class InteriorPointStatus(enum.Enum):
@@ -83,7 +89,7 @@ class LinalgOptions(ConfigDict):
         self.declare('reallocation_factor', ConfigValue(domain=PositiveFloat))
         self.declare('max_num_reallocations', ConfigValue(domain=NonNegativeInt))
 
-        self.solver = None
+        self.solver: LinearSolverInterface = None
         self.reallocation_factor = 2
         self.max_num_reallocations = 5
 
@@ -189,21 +195,21 @@ def check_convergence(interface, barrier, error_scaling: float, timer=None):
         timer = HierarchicalTimer()
 
     slacks = interface.get_slacks()
-    timer.start('grad obj')
+    timer.start('grad_obj')
     grad_obj = interface.get_obj_factor() * interface.evaluate_grad_objective()
-    timer.stop('grad obj')
-    timer.start('jac eq')
+    timer.stop('grad_obj')
+    timer.start('jac_eq')
     jac_eq = interface.evaluate_jacobian_eq()
-    timer.stop('jac eq')
-    timer.start('jac ineq')
+    timer.stop('jac_eq')
+    timer.start('jac_ineq')
     jac_ineq = interface.evaluate_jacobian_ineq()
-    timer.stop('jac ineq')
-    timer.start('eq cons')
+    timer.stop('jac_ineq')
+    timer.start('eq_cons')
     eq_resid = interface.evaluate_eq_constraints()
-    timer.stop('eq cons')
-    timer.start('ineq cons')
+    timer.stop('eq_cons')
+    timer.start('ineq_cons')
     ineq_resid = interface.evaluate_ineq_constraints() - slacks
-    timer.stop('ineq cons')
+    timer.stop('ineq_cons')
     primals = interface.get_primals()
     duals_eq = interface.get_duals_eq()
     duals_ineq = interface.get_duals_ineq()
@@ -237,7 +243,7 @@ def check_convergence(interface, barrier, error_scaling: float, timer=None):
                        duals_slacks_lb +
                        duals_slacks_ub)
     timer.stop('grad_lag_slacks')
-    timer.start('bound resids')
+    timer.start('bound_resids')
     primals_lb_resid = (primals - primals_lb_mod) * duals_primals_lb - barrier
     primals_ub_resid = (primals_ub_mod - primals) * duals_primals_ub - barrier
     primals_lb_resid[np.isneginf(primals_lb)] = 0
@@ -246,7 +252,7 @@ def check_convergence(interface, barrier, error_scaling: float, timer=None):
     slacks_ub_resid = (ineq_ub_mod - slacks) * duals_slacks_ub - barrier
     slacks_lb_resid[np.isneginf(ineq_lb)] = 0
     slacks_ub_resid[np.isinf(ineq_ub)] = 0
-    timer.stop('bound resids')
+    timer.stop('bound_resids')
 
     if eq_resid.size == 0:
         max_eq_resid = 0
@@ -418,9 +424,10 @@ def ip_solve(interface: BaseInteriorPointInterface,
         options = IPOptions()
 
     if timer is None:
-        timer = HierarchicalTimer()
+        timer = MPIHierarchicalTimer()
+        #timer = HierarchicalTimer()
 
-    timer.start('IP solve')
+    timer.start('ip_solve')
     timer.start('init')
 
     interface.set_bounds_relaxation_factor(options.bounds_relaxation_factor)
@@ -487,9 +494,9 @@ def ip_solve(interface: BaseInteriorPointInterface,
         interface.set_duals_slacks_lb(duals_slacks_lb)
         interface.set_duals_slacks_ub(duals_slacks_ub)
 
-        timer.start('convergence check')
+        timer.start('convergence_check')
         primal_inf, dual_inf, complimentarity_inf = check_convergence(interface=interface, barrier=0, error_scaling=options.error_scaling, timer=timer)
-        timer.stop('convergence check')
+        timer.stop('convergence_check')
         objective = interface.evaluate_objective()
         logger.info('{_iter:<6}'
                     '{objective:<11.2e}'
@@ -516,12 +523,12 @@ def ip_solve(interface: BaseInteriorPointInterface,
         if max(primal_inf, dual_inf, complimentarity_inf) <= options.tol:
             status = InteriorPointStatus.optimal
             break
-        timer.start('convergence check')
+        timer.start('convergence_check')
         primal_inf, dual_inf, complimentarity_inf = check_convergence(interface=interface,
                                                                       barrier=barrier_parameter,
                                                                       error_scaling=options.error_scaling,
                                                                       timer=timer)
-        timer.stop('convergence check')
+        timer.stop('convergence_check')
         if max(primal_inf, dual_inf, complimentarity_inf) \
                 <= options.barrier_decrease * barrier_parameter:
             barrier_parameter = max(options.minimum_barrier_parameter,
@@ -562,18 +569,18 @@ def ip_solve(interface: BaseInteriorPointInterface,
         timer.stop('numeric')
         timer.stop('factorize')
 
-        timer.start('back solve')
-        delta = options.linalg.solver.do_back_solve(rhs)
-        timer.stop('back solve')
+        timer.start('back_solve')
+        delta = options.linalg.solver.do_back_solve(rhs, timer, barrier_parameter, _iter)
+        timer.stop('back_solve')
 
         interface.set_primal_dual_kkt_solution(delta)
-        timer.start('frac boundary')
+        timer.start('frac_boundary')
         alpha_primal_max, alpha_dual_max = fraction_to_the_boundary(interface=interface, tau=1 - barrier_parameter)
         if options.unified_step:
             tmp = min(alpha_primal_max, alpha_dual_max)
             alpha_primal_max = tmp
             alpha_dual_max = tmp
-        timer.stop('frac boundary')
+        timer.stop('frac_boundary')
 
         delta_primals = interface.get_delta_primals()
         delta_slacks = interface.get_delta_slacks()
@@ -625,10 +632,11 @@ def ip_solve(interface: BaseInteriorPointInterface,
         duals_slacks_lb += alpha * delta_duals_slacks_lb
         duals_slacks_ub += alpha * delta_duals_slacks_ub
 
-    timer.stop('IP solve')
+    timer.stop('ip_solve')
     if options.report_timing:
-        print(timer)
-    return status
+        #print(timer)
+        return status, timer
+    return status, None
 
 
 def try_factorization_and_reallocation(kkt, linear_solver: LinearSolverInterface, reallocation_factor, max_iter,

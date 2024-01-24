@@ -6,3 +6,5 @@ from .mumps_interface import MumpsInterface
 from .mkl_pardiso_interface import InteriorPointMKLPardisoInterface
 from .schur_complement.explicit_schur_complement import SchurComplementLinearSolver
 from .schur_complement.mpi_explicit_schur_complement import MPISchurComplementLinearSolver
+from .schur_complement.implicit_schur_complement import ImplicitSchurComplementLinearSolver
+from .schur_complement.mpi_implicit_schur_complement import MPIImplicitSchurComplementLinearSolver

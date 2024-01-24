@@ -40,7 +40,7 @@ class LinearSolverInterface(ABC):
         raise NotImplementedError('Should be implemented by base class.')
 
     @abstractmethod
-    def do_back_solve(self, rhs):
+    def do_back_solve(self, rhs, timer=None, barrier=None, ip_iter=None):
         """
         Solve the linear system matrix * x = rhs for x. Can only be called
         after do_numeric_factorization.
