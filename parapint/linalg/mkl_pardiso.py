@@ -16,7 +16,7 @@ class MKLPardisoInterface(object):
     @classmethod
     def available(cls):
         if cls.libname is _NotSet:
-            cls.libname = find_library('mkl_rt')
+            cls.libname = find_library('mkl_rt', pathlist=['/home/llueg/software/intel/oneapi/mkl/2024.0/lib'])
         if cls.libname is None:
             return False
         return os.path.exists(cls.libname)
@@ -27,49 +27,49 @@ class MKLPardisoInterface(object):
 
         self._dim_cached = None
 
-        self.lib = ctypes.cdll.LoadLibrary(self.libname)
+        self.lib = npct.load_library('libmkl_rt', '/home/llueg/software/intel/oneapi/mkl/2024.0/lib/')
+        flags = ('F_CONTIGUOUS', 'ALIGNED')
 
-        array_1d_double = npct.ndpointer(dtype=np.double, ndim=1, flags='CONTIGUOUS')
-        array_2d_double = npct.ndpointer(dtype=np.double, ndim=2, flags='CONTIGUOUS')
-        array_1d_int = npct.ndpointer(dtype=NP_INT_TYPE, ndim=1, flags='CONTIGUOUS')
+        array_1d_double = npct.ndpointer(dtype=np.double, ndim=1, flags=flags)
+        array_1d_int = npct.ndpointer(dtype=NP_INT_TYPE, ndim=1, flags=flags)
 
         # Declare arg and res types of functions:
-        # TODO: Consistent choice array_1d_int ot pointer(INT_TYPE), etc.
-        #self.lib.pardiso.restype = ctypes.c_void_p
         self.lib.pardiso.restype = None
-        self.lib.pardiso.argtypes = [ctypes.POINTER(PT_INT_TYPE),   # pt
+        self.lib.pardiso.argtypes = [npct.ndpointer(dtype=np.int64, ndim=1, flags=flags),   # pt
                                      ctypes.POINTER(INT_TYPE),      # maxfct
                                      ctypes.POINTER(INT_TYPE),      # mnum
                                      ctypes.POINTER(INT_TYPE),      # mtype
                                      ctypes.POINTER(INT_TYPE),      # phase
                                      ctypes.POINTER(INT_TYPE),      # n
-                                     ctypes.POINTER(None),          # a
-                                     ctypes.POINTER(INT_TYPE),      # ia
-                                     ctypes.POINTER(INT_TYPE),      # ja
-                                     ctypes.POINTER(INT_TYPE),      # perm
+                                     array_1d_double,          # a
+                                     array_1d_int,      # ia
+                                     array_1d_int,      # ja
+                                     array_1d_int,      # perm
                                      ctypes.POINTER(INT_TYPE),      # nrhs
-                                     ctypes.POINTER(INT_TYPE),      # iparm
+                                     array_1d_int,      # iparm
                                      ctypes.POINTER(INT_TYPE),      # msglvl
-                                     ctypes.POINTER(None),          # b
-                                     ctypes.POINTER(None),          # x
+                                     array_1d_double,          # b
+                                     array_1d_double,          # x
                                      ctypes.POINTER(INT_TYPE)]      # error
-        
+       
         self.lib.pardiso_export.restype = None
-        self.lib.pardiso_export.argtypes = [ctypes.POINTER(PT_INT_TYPE),   # pt
-                                            ctypes.POINTER(None),          # values
-                                            ctypes.POINTER(INT_TYPE),      # rows
-                                            ctypes.POINTER(INT_TYPE),      # cols
+        self.lib.pardiso_export.argtypes = [npct.ndpointer(dtype=np.int64, ndim=1, flags=flags),   # pt
+                                            array_1d_double,          # values
+                                            array_1d_int,      # rows
+                                            array_1d_int,      # cols
                                             ctypes.POINTER(INT_TYPE),      # step
-                                            ctypes.POINTER(INT_TYPE),      # iparm
+                                            array_1d_int,      # iparm
                                             ctypes.POINTER(INT_TYPE)]      # error
-
-
+       
+        self.lib.pardisoinit.restype = None
+        self.lib.pardisoinit.argtypes = [npct.ndpointer(dtype=np.int64, ndim=1, flags=flags),   # pt
+                                        ctypes.POINTER(INT_TYPE),      # mtype
+                                        array_1d_int,      # iparm
+                                        ]
+        
         # Parameters to pardiso fct
-        self._pt = np.zeros(64, dtype=PT_INT_TYPE)
+        self._pt = np.zeros(64, dtype=np.int64)
         self._iparm = np.zeros(64, dtype=NP_INT_TYPE)
-        # self._iparm[0] = 1
-        # self._iparm[1] = 3
-        # self._iparm[9] = 8
         self._maxfct = 1
         self._mnum = 1
         self._mtype = -2 # Always assumes real symmetric indefinite matrix
@@ -98,35 +98,71 @@ class MKLPardisoInterface(object):
         self._sc_ja = np.zeros(0, dtype=NP_INT_TYPE)
         self._sc = sp.csr_matrix(0)
 
+        self.lib.pardisoinit(self._pt,
+                             ctypes.byref(INT_TYPE(self._mtype)),
+                             self._iparm)
+        self._default_iparm = self._iparm.copy()
+
+    def _set_iparm_default(self):
+        iparm = self._default_iparm.copy()
+        # iparm[26] = 1
+        iparm[9] = 13
+        #iparm[1] = 0
+        iparm[10] = 1
+        iparm[12] = 1
+        #iparm[23] = 1
+        #iparm[33] = 1
+        #iparm[24] = 1
+        self._iparm = iparm
+    
+    def _set_iparm_schur(self):
+        iparm = self._default_iparm.copy()
+        #iparm[0] = 1
+        #iparm[1] = 0
+        #iparm[8] = 10
+        #iparm[7] = 8
+        iparm[9] = 13
+        #iparm[23] = 1
+        #iparm[34] = 1
+        iparm[30] = 0
+        iparm[35] = 2
+        #iparm[20] = 0
+        
+        iparm[10] = 1
+        iparm[12] = 1
+        #iparm[26] = 1
+        
+        self._iparm = iparm.copy()
+
     def _call_pardiso(self):
         assert self._a.size == self._ja.size == self._ia[-1] - 1, 'Dimension mismatch in CSR data and row arrays'
         self.lib.pardiso(
-                            self._pt.ctypes.data_as(ctypes.POINTER(PT_INT_TYPE)),
+                            self._pt,
                             ctypes.byref(INT_TYPE(self._maxfct)),
                             ctypes.byref(INT_TYPE(self._mnum)),
                             ctypes.byref(INT_TYPE(self._mtype)),
                             ctypes.byref(INT_TYPE(self._phase)),
                             ctypes.byref(INT_TYPE(self._dim)),
-                            self._a.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                            self._ia.ctypes.data_as(ctypes.POINTER(INT_TYPE)),
-                            self._ja.ctypes.data_as(ctypes.POINTER(INT_TYPE)),
-                            self._perm.ctypes.data_as(ctypes.POINTER(INT_TYPE)),
+                            self._a,
+                            self._ia,
+                            self._ja,
+                            self._perm,
                             ctypes.byref(INT_TYPE(self._nrhs)),
-                            self._iparm.ctypes.data_as(ctypes.POINTER(INT_TYPE)),
+                            self._iparm,
                             ctypes.byref(INT_TYPE(self._msglvl)),
-                            self._b.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                            self._x.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+                            self._b,
+                            self._x,
                             ctypes.byref(INT_TYPE(self._error)),
                         )
         
     
     def _call_pardiso_export(self):
-        self.lib.pardiso_export(self._pt.ctypes.data_as(ctypes.POINTER(PT_INT_TYPE)),
-                                self._sc_a.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-                                self._sc_ia.ctypes.data_as(ctypes.POINTER(INT_TYPE)),
-                                self._sc_ja.ctypes.data_as(ctypes.POINTER(INT_TYPE)),
+        self.lib.pardiso_export(self._pt,
+                                self._sc_a,
+                                self._sc_ia,
+                                self._sc_ja,
                                 ctypes.byref(INT_TYPE(self._sc_step)),
-                                self._iparm.ctypes.data_as(ctypes.POINTER(INT_TYPE)),
+                                self._iparm,
                                 ctypes.byref(INT_TYPE(self._error)))
 
     def __del__(self):
@@ -152,6 +188,7 @@ class MKLPardisoInterface(object):
         self._dim = ia.size - 1
 
         self._phase = 11
+        self._set_iparm_default()
 
         self._call_pardiso()
 
@@ -177,6 +214,7 @@ class MKLPardisoInterface(object):
 
         self._phase = 22
         self._a = a
+        self._set_iparm_default()
 
         self._call_pardiso()
         
@@ -196,6 +234,7 @@ class MKLPardisoInterface(object):
         self._phase = 33
         self._b = rhs
         self._x = np.zeros_like(self._b)
+        self._set_iparm_default()
 
         self._call_pardiso()
 
@@ -216,18 +255,14 @@ class MKLPardisoInterface(object):
         self._phase = 11
 
         # Set necesasary parameters
-        self._iparm[0] = 1
-        self._iparm[35] = -2 # Compute Schur
-        # Other params set with Schur - taken from PIPS-IPM C interface
-        self._iparm[10] = 0
-        self._iparm[12] = 0
-        self._iparm[23] = 1
+        self._set_iparm_schur()
 
         self._call_pardiso()
 
-        assert(self._iparm[35] >= 0)
+        #assert(self._iparm[35] >= 0)
 
         self._sc_nnz = self._iparm[35]
+        # self._iparm[35] = -2 
 
         return self._error
 
@@ -248,24 +283,31 @@ class MKLPardisoInterface(object):
 
         if self._phase < 11:
             raise RuntimeError('Symbolic factorization has not been performed.')
-        else:
-            if (self._ia != ia).any() or (self._ja != ja).any():
-                raise RuntimeError('Symbolic factorization has not been performed on this matrix.')
+        #else:
+            # if (self._ia != ia).any() or (self._ja != ja).any():
+            #     old_mat = sp.csr_matrix((self._a, self._ja, self._ia), shape=(self._dim, self._dim))
+            #     new_mat = sp.csr_matrix((a, ja, ia), shape=(dim, dim))
+
+            #     raise RuntimeError('Symbolic factorization has not been performed on this matrix.')
 
         self._sc_ia = np.zeros(self._sc_dim + 1, dtype=NP_INT_TYPE)
         self._sc_ja = np.zeros(self._sc_nnz, dtype=NP_INT_TYPE)
         self._sc_a = np.zeros(self._sc_nnz, dtype=np.double)
 
-        self._iparm[35] = -2
         self._sc_step = 1
+        self._set_iparm_schur()
+        #self._iparm[35] = -1
 
-        self._call_pardiso_export()
+        #self._call_pardiso_export()
 
         self._phase = 22
         self._a = a
+        self._ia = ia
+        self._ja = ja
+        self._x = np.zeros(self._sc_dim ** 2, dtype=np.double)
         self._call_pardiso()
 
-        self._sc = sp.csr_matrix((self._sc_a, self._sc_ja, self._sc_ia), shape=(self._sc_dim, self._sc_dim))
+        self._sc = self._x.copy().reshape(self._sc_dim, self._sc_dim)
 
         return self._error
     
@@ -281,9 +323,14 @@ class MKLPardisoInterface(object):
             ' Dimension of rhs does not match diemnsion of upper left block in factorized matrix.'
         )
 
+        
+        # self._iparm[8] = 10
+        # self._iparm[9] = 8
+        # self._iparm[35] = 2
+        self._set_iparm_schur()
+        self._iparm[35] = 2
         self._iparm[7] = 0
         self._iparm[9] = 0
-        self._iparm[35] = 2
 
         self._b = np.zeros(self._dim, dtype=np.double)
         self._b[:self._dim - self._sc_dim] = rhs
@@ -295,18 +342,18 @@ class MKLPardisoInterface(object):
 
         self._phase = 332
         self._b = self._x.copy()
-        self._x = np.zeros_like(self._b)
+        #self._x = np.zeros_like(self._b)
 
         self._call_pardiso()
 
         self._phase = 333
         self._b = self._x.copy()
         self._b[-self._sc_dim:] = 0
-        self._x = np.zeros_like(self._b)
+        #self._x = np.zeros_like(self._b)
 
         self._call_pardiso()
 
-        self._iparm[35] = -2
+        # self._iparm[35] = -2
 
         res = self._x[:self._dim - self._sc_dim]
         return res
