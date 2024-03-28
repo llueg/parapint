@@ -374,7 +374,9 @@ def numeric_factorization(interface: BaseInteriorPointInterface,
         _iter = 0
         while final_inertia_coef <= options.inertia_correction.max_coef:
             if status == LinearSolverStatus.successful:
+                timer.start('inertia_check')
                 pos_eig, neg_eig, zero_eig = options.linalg.solver.get_inertia()
+                timer.stop('inertia_check')
             else:
                 pos_eig, neg_eig, zero_eig = None, None, None
             logger.debug('{reg_iter:<10}{num_realloc:<10}{reg_coef:<10.2e}'
@@ -388,6 +390,7 @@ def numeric_factorization(interface: BaseInteriorPointInterface,
                 break
             if _iter == 0:
                 kkt = kkt.copy()
+            timer.start('regularize')
             kkt = interface.regularize_equality_gradient(kkt=kkt, coef=-inertia_coef, copy_kkt=False)
             kkt = interface.regularize_hessian(kkt=kkt, coef=inertia_coef, copy_kkt=False)
             status, num_realloc = try_factorization_and_reallocation(kkt=kkt,
@@ -399,6 +402,7 @@ def numeric_factorization(interface: BaseInteriorPointInterface,
             final_inertia_coef = inertia_coef
             inertia_coef *= options.inertia_correction.factor_increase
             _iter += 1
+            timer.stop('regularize')
 
         if ((neg_eig != interface.n_eq_constraints() + interface.n_ineq_constraints()) or
             (zero_eig != 0) or
@@ -652,11 +656,15 @@ def try_factorization_and_reallocation(kkt, linear_solver: LinearSolverInterface
         method = linear_solver.do_symbolic_factorization
     for count in range(max_iter):
         res = method(matrix=kkt, raise_on_error=False, timer=timer)
+        timer.start('check_memory')
         status = res.status
         if status == LinearSolverStatus.not_enough_memory:
             linear_solver.increase_memory_allocation(reallocation_factor)
+            timer.stop('check_memory')
         else:
+            timer.stop('check_memory')
             break
+        
     return status, count
 
 

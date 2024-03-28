@@ -114,8 +114,9 @@ class MPIDistributedImplicitSchurComplementLinearSolver(LinearSolverInterface):
         #self._factorize_sc_flag = True
         #self._form_sc_flag = True
         self._use_direct_preconditioner_flag = True
-        def direct_preconditioner(r):
-            return self._distributed_preconditioner(r)
+        def direct_preconditioner(r, rhs, x_k, timer=None):
+            return self._two_level_distributed_preconditioner(r, rhs, x_k, timer)
+            #return self._distributed_preconditioner(r)
 
         self._factorize_sc_threshold = -1
 
@@ -231,12 +232,19 @@ class MPIDistributedImplicitSchurComplementLinearSolver(LinearSolverInterface):
         sc_dim = block_matrix.get_row_size(self.block_dim - 1)
         self.border_matrices = dict()
         self.weighting_matrix = np.zeros(sc_dim, dtype=np.double)
+        self.R_0 = np.zeros((self.block_dim - 1, sc_dim), dtype=np.double)
+        local_R_0 = np.zeros((self.block_dim - 1, sc_dim), dtype=np.double)
         for ndx in self.local_block_indices:
             self.border_matrices[ndx] = _BorderMatrix(block_matrix.get_block(self.block_dim - 1, ndx))
             self.weighting_matrix[self.border_matrices[ndx].nonzero_rows] += 1
+            local_R_0[ndx, self.border_matrices[ndx].nonzero_rows] = 1
         
         self.weighting_matrix = comm.allreduce(self.weighting_matrix)
         self.weighting_matrix = 1/self.weighting_matrix
+        #print(f'rank {rank}, weighting matrix: {self.weighting_matrix}')
+        comm.Allreduce(local_R_0, self.R_0)
+        self.R_0 = self.R_0 @ np.diag(self.weighting_matrix)
+        #print(f'rank {rank}, R_0: {self.R_0}')
 
         timer.stop('build_border_matrices')
 
@@ -299,11 +307,14 @@ class MPIDistributedImplicitSchurComplementLinearSolver(LinearSolverInterface):
             sub_res = self.subproblem_solvers[ndx].do_numeric_factorization(matrix=block_matrix.get_block(ndx, ndx),
                                                                             raise_on_error=False)
             timer.stop('block_factorize')
+            timer.start('process_results')
             _process_sub_results(res, sub_res)
+            timer.stop('process_results')
             if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
                 break
-
+        timer.start('communicate')
         res = _gather_results(res)
+        timer.stop('communicate')
         timer.start('form_SC')
         if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
             if raise_on_error:
@@ -323,22 +334,62 @@ class MPIDistributedImplicitSchurComplementLinearSolver(LinearSolverInterface):
             local_sc_dim = border_matrix.num_nonzero_rows
             self.local_schur_complements[ndx] = np.zeros((local_sc_dim, local_sc_dim), dtype=np.double)
 
-            A = border_matrix._get_reduced_matrix()
+            A = border_matrix.csr
+            Ar = border_matrix._get_reduced_matrix()
             _rhs = np.zeros(A.shape[1], dtype=np.double)
             solver = self.subproblem_solvers[ndx]
             for i, row_ndx in enumerate(border_matrix.nonzero_rows):
-                _rhs = A[i,:].toarray().flatten()
+                timer.start('get_rhs')
+                for indptr in range(A.indptr[row_ndx], A.indptr[row_ndx + 1]):
+                    col = A.indices[indptr]
+                    val = A.data[indptr]
+                    _rhs[col] += val
+                timer.stop('get_rhs')
                 timer.start('block_back_solve')
                 contribution = solver.do_back_solve(_rhs)
                 timer.stop('block_back_solve')
                 timer.start('dot_product')
-                contribution = A.dot(contribution)
+                contribution = Ar.dot(contribution)
                 timer.stop('dot_product')
+                timer.start('subtract')
                 self.local_schur_complements[ndx][i,:] -= contribution
+                timer.stop('subtract')
+                timer.start('get_rhs')
+                for indptr in range(A.indptr[row_ndx], A.indptr[row_ndx + 1]):
+                    col = A.indices[indptr]
+                    val = A.data[indptr]
+                    _rhs[col] -= val
+                timer.stop('get_rhs')
+
+            # timer.start('get_reduced_matrix')
+            # A = border_matrix._get_reduced_matrix()
+            # timer.stop('get_reduced_matrix')
+            # _rhs = np.zeros(A.shape[1], dtype=np.double)
+            # solver = self.subproblem_solvers[ndx]
+            # for i, row_ndx in enumerate(border_matrix.nonzero_rows):
+            #     timer.start('flatten')
+            #     _rhs = A[i,:].toarray().flatten()
+            #     timer.stop('flatten')
+            #     timer.start('block_back_solve')
+            #     contribution = solver.do_back_solve(_rhs)
+            #     timer.stop('block_back_solve')
+            #     timer.start('dot_product')
+            #     contribution = A.dot(contribution)
+            #     timer.stop('dot_product')
+            #     timer.start('subtract')
+            #     self.local_schur_complements[ndx][i,:] -= contribution
+            #     timer.stop('subtract')
+                
+            s_diag = block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo().diagonal()
+            sk_diag = self.weighting_matrix[border_matrix.nonzero_rows] * s_diag[border_matrix.nonzero_rows]
+            self.local_schur_complements[ndx][np.arange(local_sc_dim), np.arange(local_sc_dim)] += sk_diag
+            timer.start('convert_to_coo')
             self.local_schur_complements[ndx] = sps.coo_array(self.local_schur_complements[ndx])
+            timer.stop('convert_to_coo')
         
         timer.stop('form_SC')
 
+        timer.start('debug')
         if self._debug:
             self.schur_complement.data = np.zeros(self.schur_complement.data.size, dtype=np.double)
             for ndx in self.local_block_indices:
@@ -383,6 +434,7 @@ class MPIDistributedImplicitSchurComplementLinearSolver(LinearSolverInterface):
             _sub_res = self._debug_schur_complement_solver.do_symbolic_factorization(sc, raise_on_error=raise_on_error)
             _sub_res = self._debug_schur_complement_solver.do_numeric_factorization(sc)
 
+        timer.stop('debug')
 
         timer.start('factor_SC')
         for ndx in self.local_block_indices:
@@ -500,7 +552,7 @@ class MPIDistributedImplicitSchurComplementLinearSolver(LinearSolverInterface):
 
         return result
 
-    def get_inertia(self):
+    def get_inertia(self, timer=None):
         """
         Get the inertia. Should only be called after do_numeric_factorization.
 
@@ -513,24 +565,49 @@ class MPIDistributedImplicitSchurComplementLinearSolver(LinearSolverInterface):
         num_zero: int
             The number of zero eigenvalues of A
         """
+
+        if timer is None:
+            timer = HierarchicalTimer()
+
         num_pos = 0
         num_neg = 0
         num_zero = 0
-        diff_pos = 0
-        diff_neg = 0
-
         for ndx in self.local_block_indices:
+            timer.start('diag_block_get_inertia')
             _pos, _neg, _zero = self.subproblem_solvers[ndx].get_inertia()
+            timer.stop('diag_block_get_inertia')
             num_pos += _pos
             num_neg += _neg
             num_zero += _zero
-            _ps, _ns, _zs = self.local_schur_complement_solvers[ndx].get_inertia()
-            if _ns > 0 or _zs > 0:
-                print('WARNING: Schur complement may have negative or zero eigenvalues.')
 
+        timer.start('communicate_diag')
         num_pos = comm.allreduce(num_pos)
         num_neg = comm.allreduce(num_neg)
         num_zero = comm.allreduce(num_zero)
+        timer.stop('communicate_diag')
+
+        num_pos_s = 0
+        num_neg_s = 0
+        num_zero_s = 0
+        for ndx in self.local_block_indices:
+            timer.start('sc_block_get_inertia')
+            _ps, _ns, _zs = self.local_schur_complement_solvers[ndx].get_inertia()
+            timer.stop('sc_block_get_inertia')
+            num_pos_s += _ps
+            num_neg_s += _ns
+            num_zero_s += _zs
+        
+        timer.start('communicate_s')
+        #num_pos_s = comm.allreduce(num_pos_s)
+        num_neg_s = comm.allreduce(num_neg_s)
+        num_zero_s = comm.allreduce(num_zero_s)
+        timer.stop('communicate_s')
+        
+        
+        if num_neg_s > 0 or num_zero_s > 0:
+            if rank == 0:
+                print('WARNING: Schur complement may have negative or zero eigenvalues.')
+            #num_neg = -1
 
         # _pos, _neg, _zero = self.schur_complement_solver.get_inertia()
 
@@ -570,7 +647,111 @@ class MPIDistributedImplicitSchurComplementLinearSolver(LinearSolverInterface):
         result = comm.allreduce(result)
 
         return result
-            
+
+    def _two_level_distributed_preconditioner(self, r: NDArray, rhs: NDArray, x_k: NDArray, timer: Optional = None) -> NDArray:
+
+        # r = Sx_k - rhs
+        if timer is None:
+            timer = HierarchicalTimer()
+
+        
+        D = self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
+        sc_dim = r.size
+
+        # lsc_components = [(self.local_schur_complements[ndx], self.border_matrices[ndx].nonzero_rows) for ndx in self.local_block_indices]
+        # timer.start('communicate')
+        # all_components = comm.allreduce(lsc_components)
+        # timer.stop('communicate')
+
+        # timer.start('assemble_global')
+        # sc = np.zeros((sc_dim, sc_dim), dtype=np.double)
+        # #self.sc.data = np.zeros(self.sc.data.size, dtype=np.double)
+        # for components in all_components:
+        #     sc[np.ix_(components[1], components[1])] += components[0]
+        # timer.stop('assemble_global')
+
+        # timer.start('to_coo')
+        # sc = coo_matrix(sc)
+        # #sc = coo_matrix(self.sc)
+        # timer.stop('to_coo')
+        # timer.start('compute A_0')
+        # A_0 = self.R_0 @ sc @ self.R_0.T
+        # timer.stop('compute A_0')
+        timer.start('compute A_0')
+        num_p = len(self.subproblem_solvers)
+        A_0 = np.zeros((num_p, num_p), dtype=np.double)
+        for k in range(num_p):
+            sr_0_i = self._schur_matvec_mpi(self.R_0[k,:].transpose(), D, timer=timer)
+            A_0[:, k] = self.R_0.dot(sr_0_i)
+        timer.stop('compute A_0')
+        timer.start('compute A_0_inv')
+        A_0_inv = np.linalg.inv(A_0)
+        timer.stop('compute A_0_inv')
+        # residual = rhs - self._schur_matvec_mpi(x_k, D)
+
+        timer.start('apply precond')
+        residual = - r
+        v1 = self.R_0.T.dot(A_0_inv.dot(self.R_0.dot(residual)))
+
+        u = x_k + v1
+        
+        rn = rhs - self._schur_matvec_mpi(u, D)
+
+
+        result = np.zeros_like(r)
+        for ndx in self.local_block_indices:
+            n_mat = self.border_matrices[ndx]._get_selection_matrix()
+            r_local = n_mat.transpose().dot(self.weighting_matrix * rn)
+            x_local = self.local_schur_complement_solvers[ndx].do_back_solve(r_local)
+            result += self.weighting_matrix * n_mat.dot(x_local)
+
+        result = comm.allreduce(result)
+
+        u = u + result
+        rn = rhs - self._schur_matvec_mpi(u, D)
+        #rn = rhs
+        u = u + self.R_0.T.dot(A_0_inv.dot(self.R_0.dot(rn)))
+
+        timer.stop('apply precond')
+
+        return u - x_k
+
+
+    def _schwarz_distributed_preconditioner(self, r: NDArray, rhs: NDArray, x_k: NDArray, timer: Optional = None) -> NDArray:
+
+        if timer is None:
+            timer = HierarchicalTimer()
+        pass
+
+
+    def _schur_matvec_mpi(self, u: NDArray, D, timer=None) -> NDArray:
+
+        if timer is None:
+            timer = HierarchicalTimer()
+
+        res = np.zeros_like(u)
+        for ndx in self.local_block_indices:
+            # border_matrix: _BorderMatrix = self.border_matrices[ndx]
+            # A = border_matrix.csr.transpose()
+            # timer.start('dot_product')
+            # v = A.dot(u)
+            # timer.stop('dot_product')
+            # timer.start('block_back_solve')
+            # x = self.subproblem_solvers[ndx].do_back_solve(v)
+            # timer.stop('block_back_solve')
+            # timer.start('dot_product')
+            # y = A.transpose().dot(x)
+            # timer.stop('dot_product')
+            # res -= y
+            res += self.border_matrices[ndx]._get_selection_matrix() @ self.local_schur_complements[ndx] @ (self.border_matrices[ndx]._get_selection_matrix().transpose() @ u)
+
+        timer.start('communicate')
+        res_global = np.empty(res.size)
+        # print(res.size)
+        comm.Allreduce(res, res_global)
+        timer.stop('communicate')
+        res_global += D.dot(u)
+        return res_global
 
     def pcg_schur_solve(self, schur_complement_rhs, ip_iter, timer=None, tol=1e-8, x0=None, use_direct_preconditioner=False):
 
@@ -579,36 +760,13 @@ class MPIDistributedImplicitSchurComplementLinearSolver(LinearSolverInterface):
 
         D = self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
 
-        def schur_matvec_mpi(u: NDArray) -> NDArray:
-            res = np.zeros_like(u)
-            for ndx in self.local_block_indices:
-                border_matrix: _BorderMatrix = self.border_matrices[ndx]
-                A = border_matrix.csr.transpose()
-                timer.start('dot_product')
-                v = A.dot(u)
-                timer.stop('dot_product')
-                timer.start('block_back_solve')
-                x = self.subproblem_solvers[ndx].do_back_solve(v)
-                timer.stop('block_back_solve')
-                timer.start('dot_product')
-                y = A.transpose().dot(x)
-                timer.stop('dot_product')
-                res -= y
-
-            timer.start('communicate')
-            res_global = np.empty(res.size)
-           # print(res.size)
-            comm.Allreduce(res, res_global)
-            timer.stop('communicate')
-            res_global += D.dot(u)
-            return res_global
-
-        coupling, info = self._cg.solve(linear_operator=schur_matvec_mpi,
+        coupling, info = self._cg.solve(linear_operator=lambda r: self._schur_matvec_mpi(r, D, timer),
                                         rhs=schur_complement_rhs,
                                         tol=tol,
                                         ip_iter=ip_iter,
                                         x0=x0, timer=timer, use_direct_preconditioner=use_direct_preconditioner)
         
+        #print('PCG iterations: ', info['n_iter'])
 
         return coupling, info
 
@@ -700,14 +858,13 @@ class ConjugateGradientSolver:
         for k in range(self._max_iter):
             if self._beta_update == 'PR':
                 z_k_prev = z_k.copy()
-            # TODO: See if this makes sense generally - intermittently factorizing S - incorporate into preqn?
             # if ip_iter > -1:
             #     z_k = self._preconditioner.preqn(ip_iter, k, r_k, d_k, w_k)
             # else:
             #     zz_k = self._preconditioner.preqn(ip_iter, k, r_k, d_k, w_k)
             #     z_k = self._tmp_precond(r_k)
             timer.start('precondition')
-            z_k = self._preconditioner.preqn(ip_iter, k, r_k, d_k, w_k, timer, use_direct_preconditioner)
+            z_k = self._preconditioner.preqn(ip_iter, k, r_k, d_k, w_k, x_k, timer, use_direct_preconditioner, rhs)
             timer.stop('precondition')
             norm2 = norm1
             norm1 = r_k.T.dot(z_k)
@@ -764,14 +921,14 @@ class Preqn:
     H: NDArray
     _direct_preconditioner: Optional[Callable] = None
 
-    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray,
-           timer: Optional[HierarchicalTimer] = None, use_direct_preconditioner: bool = False):
+    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray, x_k: Optional[NDArray] = None,
+           timer: Optional[HierarchicalTimer] = None, use_direct_preconditioner: bool = False, rhs=None):
         raise NotImplementedError
 
 class PreqnNone(Preqn):
 
-    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray,
-           timer: Optional[HierarchicalTimer] = None, use_direct_preconditioner: bool = False):
+    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray, x_k: Optional[NDArray] = None,
+           timer: Optional[HierarchicalTimer] = None, use_direct_preconditioner: bool = False, rhs=None):
         if ip_iter == 0 and cg_iter == 0:
             n = residual.size
             self.H = np.eye(n)
@@ -785,8 +942,8 @@ class PardisoPreqn(Preqn):
 
         self._direct_preconditioner: Callable = direct_preconditioner
 
-    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray,
-           timer: Optional[HierarchicalTimer] = None, use_direct_preconditioner: bool = False):
+    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray, x_k: Optional[NDArray] = None,
+           timer: Optional[HierarchicalTimer] = None, use_direct_preconditioner: bool = False, rhs=None):
         # if not use_direct_preconditioner:
         #     ret = np.zeros_like(residual)
         #     contribution = np.zeros_like(residual)
@@ -806,7 +963,7 @@ class PardisoPreqn(Preqn):
         #     comm.Allreduce(contribution, ret)
         #     return ret
         # else:
-        return self._direct_preconditioner(residual)
+        return self._direct_preconditioner(residual, rhs, x_k, timer)
 
 class BfgsPreqn(Preqn):
 
@@ -819,7 +976,7 @@ class BfgsPreqn(Preqn):
         self.H_prev: NDArray = np.empty(())
         self._direct_preconditioner: Callable = direct_preconditioner
 
-    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray,
+    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray, x_k: Optional[NDArray] = None,
            timer: Optional[HierarchicalTimer] = None, use_direct_preconditioner: bool = False):
         if timer is None:
             timer = HierarchicalTimer()
@@ -902,7 +1059,7 @@ class LbfgsPreqn(Preqn):
             return k, rem_idx
 
 
-    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray,
+    def preqn(self, ip_iter: int, cg_iter: int, residual: NDArray, d_k: NDArray, w_k:NDArray, x_k: Optional[NDArray] = None,
            timer: Optional[HierarchicalTimer] = None, use_direct_preconditioner: bool = False):
         if timer is None:
             timer = HierarchicalTimer()
