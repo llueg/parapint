@@ -39,30 +39,28 @@ def get_base_matrix_wrong_order(use_tril):
     mat = coo_matrix((data, (row, col)), shape=(3,3), dtype=np.double)
     return mat
 
-def get_schur_complement_matrices(use_tril):
+def get_schur_complement_matrices(n=10, m=5, seed=0):
     # define invertible matrix with structure
     # [A   B]
     # [B^T D]
     # and return the Schur complement
-    nh = 10
-    m = 5
-    H = sps.random(nh, nh, density=0.3, random_state=0)
-    H = H + H.T + 10 * np.eye(nh)
-    B = sps.random(nh, m, density=0.3, random_state=0)
-    A = np.zeros((nh + m, nh + m))
+    rng = np.random.default_rng(seed)
+    H = sps.random(n, n, density=0.3, random_state=rng)
+    H = H + H.T + 10 * np.eye(n)
+    B = sps.random(n, m, density=0.3, random_state=rng).todense() + np.eye(N=m, M=n).T
+    A = np.zeros((n + m, n + m))
     D = 0.1 * np.eye(m)
-    A[:nh, :nh] = H
-    A[:nh, nh:] = B.todense()
-    A[nh:, :nh] = B.todense().T
-    A[nh:, nh:] = D
+    A[:n, :n] = H
+    A[:n, n:] = B.A
+    A[n:, :n] = B.A.T
+    A[n:, n:] = D
     
     S = D - B.T @ np.linalg.inv(H) @ B
-    if use_tril:
-        A = np.tril(A)
-    full_mat = coo_matrix(A)
-    H_mat = coo_matrix(H)
-    S_mat = coo_matrix(S)
-    return full_mat, H_mat, S_mat
+
+    A = coo_matrix(A)
+    H = coo_matrix(H)
+    S = coo_matrix(S)
+    return A, H, S
 
 class TestTrilBehavior(unittest.TestCase):
     """
@@ -93,6 +91,7 @@ class TestLinearSolvers(unittest.TestCase):
         mat = get_base_matrix(use_tril=False)
         # Note: As of now, MKL Pardiso needs filled matrix even for symbolic factorization,
         # as zero diagonal elements are not allowed.
+        # Also, MKL Pardiso need triu not tril - for now just disabling it
         #zero_mat = mat.copy()
         #zero_mat.data.fill(0)
         stat = solver.do_symbolic_factorization(mat)
@@ -183,7 +182,38 @@ class TestWrongNonzeroOrdering(unittest.TestCase):
     @unittest.skipIf(not ma27_available, 'MA27 is needed for interior point MA27 tests')
     def test_ma27(self):
         solver = parapint.linalg.InteriorPointMA27Interface()
+        self._test_solvers(solver, use_tril=False)
+
+    @pytest.mark.serial
+    @pytest.mark.fast
+    @unittest.skipIf(not mkl_pardiso_available, 'MKL Pardiso is needed for interior point MKL Pardiso tests')
+    def test_mkl_pardiso(self):
+        solver = parapint.linalg.InteriorPointMKLPardisoInterface()
         self._test_solvers(solver, use_tril=True)
+
+
+class TestSchurComplementSolver(unittest.TestCase):
+
+    def _test_schur_solvers(self, solver):
+        A, H, S = get_schur_complement_matrices()
+        #nnz_S = S.nnz
+        stat = solver.do_symbolic_factorization(A, dim_schur=S.shape[0])
+        self.assertEqual(stat.status, parapint.linalg.LinearSolverStatus.successful)
+        #self.assertEqual(nnz_S, solver.get_schur_complement_nnz())
+        stat = solver.do_numeric_factorization(A)
+        self.assertEqual(stat.status, parapint.linalg.LinearSolverStatus.successful)
+        self.assertTrue(np.allclose(S.toarray(), solver.get_schur_complement()))
+        x_true = np.ones(H.shape[0])
+        rhs = H * x_true
+        x = solver.do_back_solve(rhs)
+        self.assertTrue(np.allclose(x, x_true))
+
+    @pytest.mark.serial
+    @pytest.mark.fast
+    @unittest.skipIf(not mkl_pardiso_available, 'MKL Pardiso is needed for interior point MKL Pardiso tests')
+    def test_mkl_pardiso(self):
+        solver = parapint.linalg.InteriorPointMKLPardisoSchurInterface()
+        self._test_schur_solvers(solver)
 
 
 if __name__ == '__main__':
