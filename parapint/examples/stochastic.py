@@ -119,9 +119,6 @@ def main(farmer: Farmer, subproblem_solver_class, subproblem_solver_options):
 if __name__ == '__main__':
     # cntl[1] is the MA27 pivot tolerance
     farmer = Farmer()
-    import os
-    os.environ['MKL_NUM_THREADS'] = '1'
     main(farmer=farmer,
-         subproblem_solver_class=parapint.linalg.InteriorPointMKLPardisoInterface,
-         #subproblem_solver_options={'cntl_options': {1: 1e-6}}
-         subproblem_solver_options={})
+         subproblem_solver_class=parapint.linalg.InteriorPointMA27Interface,
+         subproblem_solver_options={'cntl_options': {1: 1e-6}})
