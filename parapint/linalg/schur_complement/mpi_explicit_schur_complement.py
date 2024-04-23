@@ -225,6 +225,33 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
 
         return res
 
+    def _get_all_nonzero_elements_in_sc(self):
+        root = 0
+        lsc_components = [self.border_matrices[ndx].nonzero_rows for ndx in self.local_block_indices]
+        # TODO: Not sure if this is the fastest way to reduce lists of arrays
+        #all_components = comm.reduce(lsc_components, root=root)
+        all_components = comm.gather(lsc_components, root=root)
+
+        if rank == root:
+            sc_dim = self.border_matrices[self.local_block_indices[0]].csr.shape[0]
+            sc = np.zeros((sc_dim, sc_dim), dtype=np.bool_)
+            for process_lists in all_components:
+                for components in process_lists:
+            #for components in all_components:
+                    print(components)
+                    sc[np.ix_(components, components)] = True
+            sc = coo_matrix(sc)
+            nonzero_rows = sc.row
+            nonzero_cols = sc.col
+        else:
+            nonzero_rows = np.zeros(0, dtype=np.int64)
+            nonzero_cols = np.zeros(0, dtype=np.int64)
+        
+        nonzero_rows = comm.bcast(nonzero_rows, root=root)
+        nonzero_cols = comm.bcast(nonzero_cols, root=root)
+        
+        return nonzero_rows, nonzero_cols
+
     def _get_sc_structure(self, block_matrix, timer):
         """
         Parameters
@@ -237,7 +264,10 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
             self.border_matrices[ndx] = _BorderMatrix(block_matrix.get_block(self.block_dim - 1, ndx))
         timer.stop('build_border_matrices')
         timer.start('gather_all_nonzero_elements')
-        nonzero_rows, nonzero_cols = _get_all_nonzero_elements_in_sc(self.border_matrices)
+        _nonzero_rows, _nonzero_cols = _get_all_nonzero_elements_in_sc(self.border_matrices)
+        nonzero_rows, nonzero_cols = self._get_all_nonzero_elements_in_sc()
+        print(f'Rows, cols new: {nonzero_rows}, {nonzero_cols}')
+        print(f'Rows, cols old: {_nonzero_rows}, {_nonzero_cols}')
         timer.stop('gather_all_nonzero_elements')
         timer.start('construct_schur_complement')
         sc_nnz = nonzero_rows.size
