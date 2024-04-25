@@ -1,9 +1,11 @@
 import numpy as np
+from numpy.typing import NDArray
 import enum
 from scipy.sparse.linalg._isolve.utils import make_system
 from scipy.optimize import LbfgsInvHessProduct
-from typing import Dict
+from typing import Dict, Tuple
 from pyomo.common.config import ConfigDict, ConfigValue, PositiveFloat, NonNegativeInt, NonNegativeFloat, InEnum
+from dataclasses import dataclass
 
 class LbfgsSamplingOptions(enum.Enum):
     last = 0
@@ -28,7 +30,7 @@ class LbfgsApproxOptions(ConfigDict):
         # TODO: not sure if this is the intended usage
         self.declare('sampling', ConfigValue(domain=InEnum(LbfgsSamplingOptions)))
 
-        self.m = 10
+        self.m: int = 10
         self.sampling = LbfgsSamplingOptions.disable
 
 class PcgOptions(ConfigDict):
@@ -45,14 +47,27 @@ class PcgOptions(ConfigDict):
                          implicit_domain=implicit_domain,
                          visibility=visibility)
         self.declare('max_iter', ConfigValue(domain=NonNegativeInt))
-        self.declare('a_tol', ConfigValue(domain=PositiveFloat))
-        self.declare('r_tol', ConfigValue(domain=PositiveFloat))
-        self.declare('lbfgs_sampling_options', ConfigValue(domain=LbfgsApproxOptions))
+        self.declare('atol', ConfigValue(domain=PositiveFloat))
+        self.declare('rtol', ConfigValue(domain=PositiveFloat))
+        self.declare('lbfgs_approx_options', LbfgsApproxOptions())
 
-        self.max_iter = None
-        self.a_tol = 1e-6
-        self.r_tol = 1e-6
-        self.lbfgs_sampling_options = LbfgsApproxOptions()
+        self.max_iter: int | None = None
+        self.atol: float = 1e-6
+        self.rtol: float = 1e-6
+        self.lbfgs_approx_options = LbfgsApproxOptions()
+
+
+class PcgSolutionStatus(enum.Enum):
+    successful = 0
+    max_iter_reached = 1
+    negative_curvature = 2
+
+@dataclass
+class PcgSolution:
+    x: NDArray
+    status: PcgSolutionStatus
+    num_iterations: int
+    hess_approx: LbfgsInvHessProduct | None = None
 
 
 class LbfgsInvHessCollector:
@@ -123,28 +138,34 @@ class LbfgsInvHessCollector:
 
 
 
-def pcg(A, b, x0=None, M=None, pcg_options: PcgOptions = PcgOptions(),
-        callback=None):
-    """Adaptation of scipy.sparse.linalg.cg
+def pcg_solve(A, b, x0=None, M=None, pcg_options: PcgOptions = PcgOptions(),
+        callback=None) -> PcgSolution:
+    """Adaptation of scipy.sparse.linalg.cg with addition of lbfgs hessian approximation
+    and termination for negative curvature
 
     """
     maxiter = pcg_options.max_iter
-    atol = pcg_options.a_tol
-    rtol = pcg_options.r_tol
-    hess_approx_options = pcg_options.lbfgs_sampling_options
+    atol = pcg_options.atol
+    rtol = pcg_options.rtol
+    hess_approx_options = pcg_options.lbfgs_approx_options
     if hess_approx_options.sampling != LbfgsSamplingOptions.disable:
         inv_hess_collector = LbfgsInvHessCollector(hess_approx_options, len(b))
         collect = lambda s, y, pcg_iter: inv_hess_collector.update(s, y, pcg_iter)
+        return_hess_approx = lambda : inv_hess_collector.pop_inv_hessian_approx()
     else:
+        inv_hess_collector = None
         collect = lambda s, y, pcg_iter: None
+        return_hess_approx = lambda : None
 
+    # Only necessary to maintain similar interface to scipy.sparse.linalg.cg
     A, M, x, b, postprocess = make_system(A, M, x0, b)
     bnrm2 = np.linalg.norm(b)
 
     atol = max(float(atol), float(rtol) * float(bnrm2))
 
     if bnrm2 == 0:
-        return postprocess(b), 0
+        return PcgSolution(x=postprocess(x), status=PcgSolutionStatus.successful,
+                           num_iterations=0, hess_approx=None)
 
     n = len(b)
 
@@ -161,7 +182,8 @@ def pcg(A, b, x0=None, M=None, pcg_options: PcgOptions = PcgOptions(),
 
     for iteration in range(maxiter):
         if np.linalg.norm(r) < atol:
-            return postprocess(x), 0
+            return PcgSolution(x=postprocess(x), status=PcgSolutionStatus.successful,
+                               num_iterations=iteration, hess_approx=return_hess_approx())
 
         z = psolve(r)
         rho_cur = dotprod(r, z)
@@ -174,17 +196,23 @@ def pcg(A, b, x0=None, M=None, pcg_options: PcgOptions = PcgOptions(),
             p[:] = z[:]
 
         q = matvec(p)
-        alpha = rho_cur / dotprod(p, q)
+        denom = dotprod(p, q)
+        if denom <= 0:
+            return PcgSolution(x=postprocess(x), status=PcgSolutionStatus.negative_curvature,
+                               num_iterations=iteration, hess_approx=return_hess_approx())
+        alpha = rho_cur / denom
         x += alpha*p
         r -= alpha*q
         rho_prev = rho_cur
 
         collect(alpha*p, -alpha*q, iteration)
+
         if callback:
             callback(x)
 
     else:
-        return postprocess(x), maxiter
+        return PcgSolution(x=postprocess(x), status=PcgSolutionStatus.max_iter_reached,
+                            num_iterations=maxiter, hess_approx=return_hess_approx())
     
 
 
