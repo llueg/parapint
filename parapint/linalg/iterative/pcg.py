@@ -76,9 +76,6 @@ class LbfgsInvHessCollector:
         self._sampling_strategy = approx_options.sampling
         self._m = approx_options.m
         self._dim = dim
-        self._sk = np.zeros((self._m, self._dim))
-        self._yk = np.zeros((self._m, self._dim))
-        self._counter = 0
 
         if approx_options.sampling == LbfgsSamplingOptions.uniform:
             # use first m-1 for uniform samples, last for current
@@ -86,9 +83,8 @@ class LbfgsInvHessCollector:
             # by limited memory quasi-newton updating.
             # SIAM Journal on Optimization, 10(4), 1079-1096.
             assert self._m % 2 == 1, 'm must be uneven for uniform sampling'
-            self._l = np.arange(1, (self._m - 1)/2 + 1)
-            self._k_indxs = list(range(0, self._m - 1))
-            self._cycle = 1
+        
+        self._reset()
 
     def _reset(self):
         self._counter = 0
@@ -100,11 +96,13 @@ class LbfgsInvHessCollector:
             self._k_indxs = list(range(0, self._m - 1))
             self._cycle = 1
 
-
     def pop_inv_hessian_approx(self):
         assert self._counter > 0, 'No samples have been collected yet.'
         if self._counter < self._m:
             ret = LbfgsInvHessProduct(self._sk[:self._counter], self._yk[:self._counter])
+        elif (self._sampling_strategy == LbfgsSamplingOptions.uniform and self._counter == self._k_indxs[-1] + 1):
+            # last iterate collected twice
+            ret = LbfgsInvHessProduct(self._sk[:-1], self._yk[:-1])
         else:
             ret = LbfgsInvHessProduct(self._sk, self._yk)
         self._reset()
