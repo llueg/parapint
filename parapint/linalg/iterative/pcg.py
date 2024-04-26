@@ -85,38 +85,49 @@ class LbfgsInvHessCollector:
             # from Morales, J.L. and Nocedal, J. (2000). Automatic preconditioning
             # by limited memory quasi-newton updating.
             # SIAM Journal on Optimization, 10(4), 1079-1096.
-            assert self._m % 2 == 1
+            assert self._m % 2 == 1, 'm must be uneven for uniform sampling'
             self._l = np.arange(1, (self._m - 1)/2 + 1)
             self._k_indxs = list(range(0, self._m - 1))
             self._cycle = 1
 
+    def _reset(self):
+        self._counter = 0
+        self._sk = np.zeros((self._m, self._dim))
+        self._yk = np.zeros((self._m, self._dim))
+        if self._sampling_strategy == LbfgsSamplingOptions.uniform:
+            assert self._m % 2 == 1, 'm must be uneven for uniform sampling'
+            self._l = np.arange(1, (self._m - 1)/2 + 1)
+            self._k_indxs = list(range(0, self._m - 1))
+            self._cycle = 1
+
+
     def pop_inv_hessian_approx(self):
-        assert self._counter > 0
+        assert self._counter > 0, 'No samples have been collected yet.'
         if self._counter < self._m:
             ret = LbfgsInvHessProduct(self._sk[:self._counter], self._yk[:self._counter])
         else:
             ret = LbfgsInvHessProduct(self._sk, self._yk)
-        self._counter = 0
-        self._sk = np.zeros((self._m, self._dim))
-        self._yk = np.zeros((self._m, self._dim))
+        self._reset()
         return ret
     
-    def update(self, s, y, pcg_iter: int) -> None:
-        if pcg_iter < self._m:
-            self._sk[pcg_iter] = s
-            self._yk[pcg_iter] = y
-            self._counter += 1
-            return None
+    def update(self, s, y) -> None:
+        if self._counter < self._m - 1:
+            self._sk[self._counter] = s
+            self._yk[self._counter] = y
         elif self._sampling_strategy == LbfgsSamplingOptions.first:
             pass
         elif self._sampling_strategy == LbfgsSamplingOptions.last:
             self._sk = np.roll(self._sk, -1, axis=0)
             self._yk = np.roll(self._yk, -1, axis=0)
         elif self._sampling_strategy == LbfgsSamplingOptions.uniform:
-            _, k_out = self._uniform_sample(pcg_iter)
+            k_out = self._uniform_sample(self._counter)
             if k_out is not None:
-                self._sk[k_out] = s
-                self._yk[k_out] = y
+                # replace k_out, maintaining order
+                self._sk[k_out:-1, :] = np.roll(self._sk[k_out:-1, :], -1, axis=0)
+                self._yk[k_out:-1, :] = np.roll(self._yk[k_out:-1, :], -1, axis=0)
+                self._sk[-2] = s
+                self._yk[-2] = y
+
         # Always keep last iterate
         self._sk[-1] = s
         self._yk[-1] = y
@@ -126,7 +137,7 @@ class LbfgsInvHessCollector:
         k_indxs = (((self._m - 1)/2) + self._l - 1) * (2 ** self._cycle)
         in_idx = self._l[np.where(k_indxs == k)]
         if len(in_idx) == 0:
-            return None, None
+            return None
         else:
             l_out = (2*in_idx[0] - 1) * (2 ** (self._cycle - 1))
             rem_idx = self._k_indxs.index(int(l_out))
@@ -134,7 +145,7 @@ class LbfgsInvHessCollector:
             self._k_indxs.append(k)
             if in_idx[0] == (self._m - 1)/2:
                 self._cycle += 1
-            return k, rem_idx
+            return rem_idx
 
 
 
@@ -150,11 +161,11 @@ def pcg_solve(A, b, x0=None, M=None, pcg_options: PcgOptions = PcgOptions(),
     hess_approx_options = pcg_options.lbfgs_approx_options
     if hess_approx_options.sampling != LbfgsSamplingOptions.disable:
         inv_hess_collector = LbfgsInvHessCollector(hess_approx_options, len(b))
-        collect = lambda s, y, pcg_iter: inv_hess_collector.update(s, y, pcg_iter)
+        collect = lambda s, y: inv_hess_collector.update(s, y)
         return_hess_approx = lambda : inv_hess_collector.pop_inv_hessian_approx()
     else:
         inv_hess_collector = None
-        collect = lambda s, y, pcg_iter: None
+        collect = lambda s, y: None
         return_hess_approx = lambda : None
 
     # Only necessary to maintain similar interface to scipy.sparse.linalg.cg
@@ -205,7 +216,7 @@ def pcg_solve(A, b, x0=None, M=None, pcg_options: PcgOptions = PcgOptions(),
         r -= alpha*q
         rho_prev = rho_cur
 
-        collect(alpha*p, -alpha*q, iteration)
+        collect(alpha*p, -alpha*q)
 
         if callback:
             callback(x)
