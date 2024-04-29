@@ -1,12 +1,7 @@
-import unittest
 import parapint
 import pytest
-from pyomo.contrib.pynumero.sparse import BlockMatrix, BlockVector
-from parapint.linalg import ScipyInterface
 import scipy.sparse as sps
-from scipy.sparse import coo_matrix
 import numpy as np
-import sys
 
 import parapint.linalg.iterative
 import parapint.linalg.iterative.pcg
@@ -118,9 +113,7 @@ def test_neg_curvature_detection(case):
     x0 = 0 * b
     pcg_options = parapint.linalg.PcgOptions()
     results = parapint.linalg.iterative.pcg.pcg_solve(A=A, b=b, x0=x0, pcg_options=pcg_options)
-
     assert results.status == parapint.linalg.iterative.pcg.PcgSolutionStatus.negative_curvature
-
 
 
 def test_hess_approx_collection_last():
@@ -199,40 +192,5 @@ def test_hess_approx_collection_uniform():
     assert np.allclose(hinv_approx.yk[-1, :], pcg_iter * np.ones(n) * (1/3))
 
 
-# def test_hess_approx_accuracy(test_case):
-#     if not test_case.expected_status == parapint.linalg.iterative.pcg.PcgSolutionStatus.successful:
-#         pytest.skip("Skipped test which is expected to fail")
-#     A = test_case.A
-#     rtol = 1e-8
-#     atol = 1e-8
-#     b = test_case.b
-#     x0 = 0 * b
-
-#     lbfgs_approx_options = parapint.linalg.iterative.pcg.LbfgsApproxOptions()
-#     lbfgs_approx_options.m = 31
-#     lbfgs_approx_options.sampling = parapint.linalg.iterative.pcg.LbfgsSamplingOptions.uniform
-
-#     pcg_options = parapint.linalg.PcgOptions()
-#     pcg_options.lbfgs_approx_options = lbfgs_approx_options
-#     pcg_options.rtol = rtol
-#     pcg_options.atol = atol
-
-#     results = parapint.linalg.iterative.pcg.pcg_solve(A=A, b=b, x0=x0, pcg_options=pcg_options)
-#     hess_approx = results.hess_approx.todense()
-
-#     #true_inv = np.linalg.inv(A)
-
-#     M = hess_approx @ A
-#     # Not a very good test - is there a case to get exact inverse from l-bfgs hess approx?
-#     dense_A = A.todense() if sps.isspmatrix(A) else A
-#     assert np.linalg.cond(M) < np.linalg.cond(dense_A)
-
-
-
 if __name__ == '__main__':
-    # execute pytest for this file
     pytest.main(['-v', __file__])
-
-
-
-
