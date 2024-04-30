@@ -124,7 +124,9 @@ def _get_all_nonzero_elements_in_sc(border_matrices: Dict[int, _BorderMatrix]):
 
     return nonzero_rows, nonzero_cols
 
-def _get_all_nonzero_elements_in_sc_using_ix(border_matrices: Dict[int, _BorderMatrix], local_block_indices: List[int], num_blocks: int):
+def _get_all_nonzero_elements_in_sc_using_ix(border_matrices: Dict[int, _BorderMatrix],
+                                             local_block_indices: List[int],
+                                             num_blocks: int):
 
     num_nnz_per_local_blocks = np.array([border_matrices[ndx].num_nonzero_rows for ndx in local_block_indices], dtype=np.int64)
     if rank == 0:
