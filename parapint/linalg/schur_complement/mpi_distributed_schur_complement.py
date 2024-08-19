@@ -34,10 +34,15 @@ class MPIASNoOverlapImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComp
         self.local_schur_complements: Dict[int, NDArray | sps.coo_array] = dict()
 
 
+    def _check_if_block_indices_local(self, block_indices: List[int]) -> None:
+        for i in block_indices:
+            assert i in self.local_block_indices, f"Block {i} not local to rank {rank}"
+
     def _form_sc_components(self,
                             timer: HierarchicalTimer
                             ) -> None:
-        for ndx in self.local_block_indices:
+
+        for ndx in self._local_block_indices_for_numeric_factorization:
             border_matrix: _BorderMatrix = self.border_matrices[ndx]
             local_sc_dim = border_matrix.num_nonzero_rows
             self.local_schur_complements[ndx] = np.zeros((local_sc_dim, local_sc_dim), dtype=np.double)
@@ -80,7 +85,7 @@ class MPIASNoOverlapImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComp
                                  ) -> LinearSolverResults:
         res = LinearSolverResults()
         res.status = LinearSolverStatus.successful
-        for ndx in self.local_block_indices:
+        for ndx in self._local_block_indices_for_numeric_factorization:
             sub_res = self.local_schur_complement_solvers[ndx].do_symbolic_factorization(self.local_schur_complements[ndx], raise_on_error=False)
             _process_sub_results(res, sub_res)
             if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
@@ -121,13 +126,70 @@ class MPIASNoOverlapImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComp
 
         return result
 
+    def get_distributed_intertia(self) -> Dict[int, tuple[int, int, int]]:
+
+        inertia_per_block = dict()
+
+        for ndx in self.local_block_indices:
+            _pos, _neg, _zero = self.subproblem_solvers[ndx].get_inertia()
+            _pos_sc, _neg_sc, _zero_sc = self.local_schur_complement_solvers[ndx].get_inertia()
+            inertia_per_block[ndx] = (_pos + _pos_sc, _neg + _neg_sc, _zero + _zero_sc)
+
+        return inertia_per_block
+
+    def do_numeric_factorization(self,
+                                 matrix: MPIBlockMatrix,
+                                 raise_on_error: bool = True,
+                                 timer: Optional[HierarchicalTimer] = None,
+                                 block_indices: Optional[List[int]] = None,
+                                 ) -> LinearSolverResults:
+
+        if block_indices is None:
+            block_indices = self.local_block_indices
+        elif block_indices == []:
+            res = LinearSolverResults()
+            res.status = LinearSolverStatus.successful
+            return res
+        else:
+            self._check_if_block_indices_local(block_indices)
+
+        self._local_block_indices_for_numeric_factorization = block_indices
+
+        if timer is None:
+            timer = HierarchicalTimer()
+
+        self.block_matrix = block_matrix = matrix
+
+        # factorize all local blocks
+        
+        res = self._numeric_factorize_diag_blocks(block_matrix, timer)
+ 
+        if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
+            if raise_on_error:
+                raise RuntimeError('Numeric factorization unsuccessful; status: ' + str(res.status))
+            else:
+                return res
+            
+        self._form_sc_components(timer)
+
+        sub_res = self._factorize_sc_components(timer)
+
+        _process_sub_results(res, sub_res)
+
+        if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
+            if raise_on_error:
+                raise RuntimeError('Symbolic factorization unsuccessful; status: ' + str(res.status))
+
+        return res
+
 
 class MPIASWithOverlapImplicitSchurComplementLinearSolver(MPIASNoOverlapImplicitSchurComplementLinearSolver):
 
+    #TODO: For inertia correction, figure out if local SC are needed too
     def _form_sc_components(self,
                             timer: HierarchicalTimer
                             ) -> None:
-        # For now, slightly inefficient computation of loca assembled SCs,
+        # For now, slightly inefficient computation of local assembled SCs,
         # by building full SC first
         self._form_full_sc(timer)
 

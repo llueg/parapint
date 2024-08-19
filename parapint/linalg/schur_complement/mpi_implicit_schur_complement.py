@@ -25,10 +25,11 @@ size: int = comm.Get_size()
 class MPISchurComplementUtilMixin:
 
     def __init__(self, subproblem_solvers: Dict[int, LinearSolverInterface]):
-        self.subproblem_solvers = subproblem_solvers
+        self.subproblem_solvers: Dict[int, LinearSolverInterface] = subproblem_solvers
         self.block_dim = 0
         self.block_matrix = None
         self.local_block_indices = list()
+        self._local_block_indices_for_numeric_factorization = list()
         self.schur_complement = coo_matrix((0, 0))
         self.border_matrices: Dict[int, _BorderMatrix] = dict()
         self.sc_data_slices = dict()
@@ -124,7 +125,7 @@ class MPISchurComplementUtilMixin:
         res = LinearSolverResults()
         res.status = LinearSolverStatus.successful
 
-        for ndx in self.local_block_indices:
+        for ndx in self._local_block_indices_for_numeric_factorization:
             timer.start('factorize')
             sub_res = self.subproblem_solvers[ndx].do_numeric_factorization(matrix=block_matrix.get_block(ndx, ndx),
                                                                             raise_on_error=False)
@@ -200,7 +201,6 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
 
         return res
 
-
     def _get_sc_structure(self,
                           block_matrix: MPIBlockMatrix,
                           timer: HierarchicalTimer
@@ -259,6 +259,8 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
 
         self.block_matrix = block_matrix = matrix
 
+        # factorize all local blocks
+        self._local_block_indices_for_numeric_factorization = self.local_block_indices
         res = self._numeric_factorize_diag_blocks(block_matrix, timer)
  
         if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
