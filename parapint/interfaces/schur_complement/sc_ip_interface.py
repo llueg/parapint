@@ -1748,6 +1748,7 @@ class StochasticSchurComplementInteriorPointInterface(BaseInteriorPointInterface
         if copy_kkt:
             kkt = kkt.copy()
         for ndx, nlp in self._nlps.items():
+            # TODO: I think we don't need the second get block, as this is done inside regularize_hessian?
             nlp.regularize_hessian(kkt=kkt.get_block(ndx, ndx).get_block(0, 0),
                                    coef=coef,
                                    copy_kkt=False)

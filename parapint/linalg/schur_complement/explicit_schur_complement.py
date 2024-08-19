@@ -4,13 +4,7 @@ from parapint.linalg.results import LinearSolverStatus, LinearSolverResults
 from scipy.sparse import coo_matrix
 from typing import Dict
 from pyomo.common.timing import HierarchicalTimer
-
-
-def _process_sub_results(res, sub_res):
-    if sub_res.status == LinearSolverStatus.successful:
-        pass
-    else:
-        res.status = sub_res.status
+from parapint.linalg.schur_complement.utils import _process_sub_results
 
 
 class SchurComplementLinearSolver(LinearSolverInterface):
