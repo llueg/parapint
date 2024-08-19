@@ -14,7 +14,7 @@ import argparse
 """
 Run this example with, e.g., 
 
-mpirun -np 4 python -m mpi4py burgers.py --nfe_x 50 --nfe_t 200 --nblocks 4
+mpirun -np 4 python -m mpi4py burgers_stoch_interface.py --nfe_x 50 --nfe_t 200 --nblocks 4
 
 If you run it with the --plot, make sure you don't use too many finite elements, or it will take forever to plot.
 """
@@ -57,11 +57,14 @@ class BurgersInterface(parapint.interfaces.MPIStochasticSchurComplementInteriorP
         self.last_t = None
         self.scenarios = list(range(num_time_blocks))
         self.delta_t = (end_t - start_t) / num_time_blocks
-        x_indices = np.linspace(0, 1, nfe_x + 1).tolist()
-        first_stage_var_ids = [('y', (x, i*self.delta_t)) for i in range(1, num_time_blocks)for x in x_indices]
+        x_indices = np.round(np.linspace(0, 1, nfe_x + 1), 2)[1:-1].tolist()
+
+        first_stage_var_ids = [('y', (x, i*self.delta_t)) for i in range(1, num_time_blocks)for x in x_indices] + \
+                                [('u', (x, i*self.delta_t)) for i in range(1, num_time_blocks) for x in x_indices]
         super(BurgersInterface, self).__init__(scenarios=self.scenarios,
                                       nonanticipative_var_identifiers=first_stage_var_ids,
                                       comm=comm)
+        #print(f'num first stage vars: {self._num_first_stage_vars}')
 
 
     def build_burgers_model(self, nfe_x=50, nfe_t=50, start_t=0, end_t=1, add_init_conditions=True):
@@ -89,6 +92,7 @@ class BurgersInterface(parapint.interfaces.MPIStochasticSchurComplementInteriorP
         def _y_init_rule(m, x):
             if x <= 0.5 * end_x:
                 return 1
+                #return np.cos(2 * np.pi * x)
             return 0
 
         m.y0 = pe.Param(m.x, default=_y_init_rule)
@@ -181,9 +185,12 @@ class BurgersInterface(parapint.interfaces.MPIStochasticSchurComplementInteriorP
         m = self.build_burgers_model(nfe_x=self.nfe_x, nfe_t=nfe_t, start_t=start_t, end_t=end_t,
                                      add_init_conditions=add_init_conditions)
 
-        end_var = {('y', (x, end_t)): m.y[x, end_t] for x in sorted(m.x) if x not in {0, 1}}
-        start_var = {('y', (x, start_t)): m.y[x, start_t] for x in sorted(m.x) if x not in {0, 1}}
-
+        end_var = {('y', (x, end_t)): m.y[x, end_t] for x in sorted(m.x) if x not in {0, 1}} | \
+                    {('u', (x, end_t)): m.u[x, end_t] for x in sorted(m.x) if x not in {0, 1}}
+        start_var = {('y', (x, start_t)): m.y[x, start_t] for x in sorted(m.x) if x not in {0, 1}} | \
+                    {('u', (x, start_t)): m.u[x, start_t] for x in sorted(m.x) if x not in {0, 1}}
+        
+        
         if scenario_identifier == 0:
             return m, end_var
         elif scenario_identifier == self._num_scenarios - 1:

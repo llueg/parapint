@@ -85,6 +85,7 @@ class BurgersInterface(parapint.interfaces.MPIDynamicSchurComplementInteriorPoin
         def _y_init_rule(m, x):
             if x <= 0.5 * end_x:
                 return 1
+                #return np.cos(2 * np.pi * x)
             return 0
 
         m.y0 = pe.Param(m.x, default=_y_init_rule)
@@ -170,10 +171,11 @@ class BurgersInterface(parapint.interfaces.MPIDynamicSchurComplementInteriorPoin
         nfe_t = math.ceil((end_t - start_t) / dt)
         m = self.build_burgers_model(nfe_x=self.nfe_x, nfe_t=nfe_t, start_t=start_t, end_t=end_t,
                                      add_init_conditions=add_init_conditions)
-
+        #print(f'start/end: {start_t}/{end_t}, nfe_t: {nfe_t}')
+        #print(f'u_indices for block {ndx}: {[tup for tup in m.u.index_set()]}')
         return (m,
-                ([m.y[x, start_t] for x in sorted(m.x) if x not in {0, 1}]),
-                ([m.y[x, end_t] for x in sorted(m.x) if x not in {0, 1}]))
+                ([m.y[x, start_t] for x in sorted(m.x) if x not in {0, 1}] + [m.u[x, start_t] for x in sorted(m.x) if x not in {0, 1}]),
+                ([m.y[x, end_t] for x in sorted(m.x) if x not in {0, 1}] + [m.u[x, end_t] for x in sorted(m.x) if x not in {0, 1}]))
 
     def plot_results(self, show_plot=True):
         y_pts = list()
@@ -208,6 +210,7 @@ class BurgersInterface(parapint.interfaces.MPIDynamicSchurComplementInteriorPoin
                 t_set.add(t)
                 y_dict[x, t] = y
             for x, t, u in u_pts:
+                #print(f'x,t,u: {x, t, u}')
                 u_dict[x, t] = u
             x_list = list(x_set)
             t_list = list(t_set)
