@@ -30,7 +30,7 @@ class LbfgsApproxOptions(ConfigDict):
         # TODO: not sure if this is the intended usage
         self.declare('sampling', ConfigValue(domain=InEnum(LbfgsSamplingOptions)))
 
-        self.m: int = 10
+        self.m: int = 11
         self.sampling = LbfgsSamplingOptions.disable
 
 class PcgOptions(ConfigDict):

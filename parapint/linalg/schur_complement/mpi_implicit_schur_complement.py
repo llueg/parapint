@@ -169,6 +169,7 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
         self.precond_options: Dict = options['preconditioner']
         self._flag_form_sc = False
         self._flag_factorize_sc = False
+        self._current_pcg_solution: PcgSolution = None
 
     def do_symbolic_factorization(self,
                                   matrix: MPIBlockMatrix,
@@ -207,10 +208,17 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
                           block_matrix: MPIBlockMatrix,
                           timer: HierarchicalTimer
                           ) -> None:
-            if self._flag_form_sc:
-                timer.start('sc_structure')
-                self._get_full_sc_structure(block_matrix=block_matrix, timer=timer)
-                timer.stop('sc_structure')
+        if self._flag_form_sc:
+            timer.start('sc_structure')
+            self._get_full_sc_structure(block_matrix=block_matrix, timer=timer)
+            timer.stop('sc_structure')
+        else:
+            # always need border matrices
+            timer.start('build_border_matrices')
+            self.border_matrices = dict()
+            for ndx in self.local_block_indices:
+                self.border_matrices[ndx] = _BorderMatrix(block_matrix.get_block(self.block_dim - 1, ndx))
+            timer.stop('build_border_matrices')
 
     def _form_sc_components(self,
                             timer: HierarchicalTimer
@@ -325,6 +333,7 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
                                          M=M_linop,
                                          pcg_options=self.pcg_options)
         coupling = pcg_sol.x
+        self._current_pcg_solution = pcg_sol
         print('Number of iterations: ', pcg_sol.num_iterations)
         self._update_preconditioner(pcg_sol)
 
@@ -473,3 +482,25 @@ class MPISpiluImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComplement
         res.status = LinearSolverStatus.successful
         return res
 
+
+class MPILbfgsImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComplementLinearSolver):
+
+    def __init__(self,
+                 subproblem_solvers: Dict[int, LinearSolverInterface],
+                 options: Dict):
+        super().__init__(subproblem_solvers=subproblem_solvers, options=options)
+        self._flag_form_sc = False
+        self._flag_factorize_sc = False
+    
+    def _update_preconditioner(self, pcg_sol: PcgSolution):
+        pass
+
+    def _apply_preconditioner(self, r: NDArray) -> NDArray:
+        if self._current_pcg_solution is None:
+            # No prev solution available
+            return r
+        return self._current_pcg_solution.hess_approx.dot(r)
+
+
+
+#TODO: Factory method for different types of implicit schur complement solvers
