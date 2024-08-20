@@ -3,6 +3,8 @@ import numpy as np
 import logging
 import time
 from parapint.linalg.results import LinearSolverStatus
+from parapint.linalg.iterative.pcg import PcgSolutionStatus
+from parapint.linalg.schur_complement.mpi_implicit_schur_complement import MPIBaseImplicitSchurComplementLinearSolver
 from pyomo.common.timing import HierarchicalTimer
 import enum
 from parapint.interfaces.interface import BaseInteriorPointInterface
@@ -83,7 +85,7 @@ class LinalgOptions(ConfigDict):
         self.declare('reallocation_factor', ConfigValue(domain=PositiveFloat))
         self.declare('max_num_reallocations', ConfigValue(domain=NonNegativeInt))
 
-        self.solver = None
+        self.solver: LinearSolverInterface = None
         self.reallocation_factor = 2
         self.max_num_reallocations = 5
 
@@ -402,6 +404,93 @@ def numeric_factorization(interface: BaseInteriorPointInterface,
     return final_inertia_coef
 
 
+def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
+                                         kkt,
+                                         options: IPOptions,
+                                         inertia_coef,
+                                         timer: Optional[HierarchicalTimer] = None
+                                         ):
+    if timer is None:
+        timer = HierarchicalTimer()
+    logger.debug('{reg_iter:<10}{num_realloc:<10}{reg_coef:<10}{pos_eig:<10}'
+                 '{neg_eig:<10}{zero_eig:<10}{status:<10}'.format(reg_iter='reg_iter', num_realloc='# realloc',
+                                                                  reg_coef='reg_coef', pos_eig='pos_eig',
+                                                                  neg_eig='neg_eig', zero_eig='zero_eig',
+                                                                  status='status'))
+    status, num_realloc = try_factorization_and_reallocation(kkt=kkt,
+                                                             linear_solver=options.linalg.solver,
+                                                             reallocation_factor=options.linalg.reallocation_factor,
+                                                             max_iter=options.linalg.max_num_reallocations,
+                                                             symbolic_or_numeric='numeric',
+                                                             timer=timer)
+
+    final_inertia_coef = 0
+    if not options.use_inertia_correction:
+        logger.debug('{reg_iter:<10}{num_realloc:<10}{reg_coef:<10.2e}'
+                     '{pos_eig:<10}{neg_eig:<10}{zero_eig:<10}'
+                     '{status:<10}'.format(reg_iter=0, num_realloc=num_realloc, reg_coef=final_inertia_coef,
+                                           pos_eig=None, neg_eig=None, zero_eig=None, status=str(status)))
+        if status != LinearSolverStatus.successful:
+            raise RuntimeError('Could not factorize KKT system; linear solver status: ' + str(status))
+        # do backsolve
+        timer.start('back solve')
+        assert isinstance(options.linalg.solver, MPIBaseImplicitSchurComplementLinearSolver), 'Expected MPIBaseImplicitSchurComplementLinearSolver'
+        solver: MPIBaseImplicitSchurComplementLinearSolver = options.linalg.solver
+        delta, pcg_status = solver.do_back_solve(interface.evaluate_primal_dual_kkt_rhs())
+        timer.stop('back solve')
+    else:
+        if status not in {LinearSolverStatus.successful, LinearSolverStatus.singular}:
+            raise RuntimeError('Could not factorize KKT system; linear solver status: ' + str(status))
+
+        pos_eig, neg_eig, zero_eig = None, None, None
+        _iter = 0
+        while final_inertia_coef <= options.inertia_correction.max_coef:
+            if status == LinearSolverStatus.successful:
+                pos_eig, neg_eig, zero_eig = options.linalg.solver.get_inertia()
+            else:
+                pos_eig, neg_eig, zero_eig = None, None, None
+            logger.debug('{reg_iter:<10}{num_realloc:<10}{reg_coef:<10.2e}'
+                         '{pos_eig:<10}{neg_eig:<10}{zero_eig:<10}'
+                         '{status:<10}'.format(reg_iter=_iter, num_realloc=num_realloc, reg_coef=final_inertia_coef,
+                                               pos_eig=str(pos_eig), neg_eig=str(neg_eig), zero_eig=str(zero_eig),
+                                               status=str(status)))
+            if ((neg_eig == interface.n_eq_constraints() + interface.n_ineq_constraints()) and
+                (zero_eig == 0) and
+                (status == LinearSolverStatus.successful)):
+                # do back solve here to check if inertia related error occurs
+                assert isinstance(options.linalg.solver, MPIBaseImplicitSchurComplementLinearSolver), 'Expected MPIBaseImplicitSchurComplementLinearSolver'
+                solver: MPIBaseImplicitSchurComplementLinearSolver = options.linalg.solver
+                timer.start('back solve')
+                delta, pcg_status = solver.do_back_solve(interface.evaluate_primal_dual_kkt_rhs())
+                timer.stop('back solve')
+                if pcg_status == PcgSolutionStatus.negative_curvature:
+                    pass
+                else:
+                    break
+                
+            if _iter == 0:
+                kkt = kkt.copy()
+            kkt = interface.regularize_equality_gradient(kkt=kkt, coef=-inertia_coef, copy_kkt=False)
+            kkt = interface.regularize_hessian(kkt=kkt, coef=inertia_coef, copy_kkt=False)
+            status, num_realloc = try_factorization_and_reallocation(kkt=kkt,
+                                                                     linear_solver=options.linalg.solver,
+                                                                     reallocation_factor=options.linalg.reallocation_factor,
+                                                                     max_iter=options.linalg.max_num_reallocations,
+                                                                     symbolic_or_numeric='numeric',
+                                                                     timer=timer)
+            final_inertia_coef = inertia_coef
+            inertia_coef *= options.inertia_correction.factor_increase
+            _iter += 1
+
+        if ((neg_eig != interface.n_eq_constraints() + interface.n_ineq_constraints()) or
+            (zero_eig != 0) or
+            (status != LinearSolverStatus.successful)):
+            raise RuntimeError('Exceeded maximum inertia correciton')
+
+    return delta, final_inertia_coef
+
+
+
 def ip_solve(interface: BaseInteriorPointInterface,
              options: Optional[IPOptions] = None,
              timer: Optional[HierarchicalTimer] = None) -> InteriorPointStatus:
@@ -550,21 +639,30 @@ def ip_solve(interface: BaseInteriorPointInterface,
             timer.stop('symbolic')
             if sym_fact_status != LinearSolverStatus.successful:
                 raise RuntimeError('Could not factorize KKT system; linear solver status: ' + str(sym_fact_status))
-        timer.start('numeric')
-        used_inertia_coef = numeric_factorization(interface=interface,
-                                                  kkt=kkt,
-                                                  options=options,
-                                                  inertia_coef=inertia_coef,
-                                                  timer=timer)
-        inertia_coef = used_inertia_coef * options.inertia_correction.factor_decrease
-        if inertia_coef < options.inertia_correction.init_coef:
-            inertia_coef = options.inertia_correction.init_coef
-        timer.stop('numeric')
-        timer.stop('factorize')
+        
+        if isinstance(options.linalg.solver, MPIBaseImplicitSchurComplementLinearSolver):
+            delta, used_inertia_coef = numeric_factorization_and_back_solve(interface=interface,
+                                                                            kkt=kkt,
+                                                                            options=options,
+                                                                            inertia_coef=inertia_coef,
+                                                                            timer=timer)
+            timer.stop('factorize')
+        else:
+            timer.start('numeric')
+            used_inertia_coef = numeric_factorization(interface=interface,
+                                                    kkt=kkt,
+                                                    options=options,
+                                                    inertia_coef=inertia_coef,
+                                                    timer=timer)
+            inertia_coef = used_inertia_coef * options.inertia_correction.factor_decrease
+            if inertia_coef < options.inertia_correction.init_coef:
+                inertia_coef = options.inertia_correction.init_coef
+            timer.stop('numeric')
+            timer.stop('factorize')
 
-        timer.start('back solve')
-        delta = options.linalg.solver.do_back_solve(rhs)
-        timer.stop('back solve')
+            timer.start('back solve')
+            delta = options.linalg.solver.do_back_solve(rhs)
+            timer.stop('back solve')
 
         interface.set_primal_dual_kkt_solution(delta)
         timer.start('frac boundary')

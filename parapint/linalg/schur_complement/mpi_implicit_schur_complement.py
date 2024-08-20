@@ -10,7 +10,7 @@ from scipy.sparse import coo_matrix, csr_matrix
 from mpi4py import MPI
 import itertools
 from .explicit_schur_complement import _process_sub_results
-from typing import Dict, Optional, List, Callable
+from typing import Dict, Optional, List, Callable, Tuple
 from pyomo.common.timing import HierarchicalTimer
 from parapint.linalg.schur_complement.utils import _gather_results, _BorderMatrix, _get_all_nonzero_elements_in_sc_using_ix
 from parapint.linalg.iterative.pcg import pcg_solve, PcgOptions, PcgSolution, PcgSolutionStatus, LbfgsInvHessProduct
@@ -283,7 +283,10 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
 
         return res
 
-    def do_back_solve(self, rhs, timer=None):
+    def do_back_solve(self,
+                      rhs,
+                      timer=None
+                      ) -> Tuple[MPIBlockVector, PcgSolutionStatus]:
         """
         Performs a back solve with the factorized matrix. Should only be called after
         do_numeric_factorixation.
@@ -299,7 +302,7 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
         """
         if timer is None:
             timer = HierarchicalTimer()
-        timer.start('back_solve')
+        
         sc_dim = rhs.get_block(self.block_dim - 1).size
         schur_complement_rhs = np.zeros(sc_dim, dtype='d')
         for ndx in self.local_block_indices:
@@ -334,9 +337,7 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
 
         result.set_block(self.block_dim-1, coupling)
 
-        timer.stop('back_solve')
-
-        return result
+        return result, pcg_sol.status
 
     def get_inertia(self):
         """
