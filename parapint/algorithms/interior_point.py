@@ -8,7 +8,9 @@ from parapint.linalg.schur_complement.mpi_implicit_schur_complement import MPIBa
 from pyomo.common.timing import HierarchicalTimer
 import enum
 from parapint.interfaces.interface import BaseInteriorPointInterface
+from parapint.interfaces.distributed_regularization import MPIDistStochasticSchurComplementInteriorPointInterface, DistStochasticSchurComplementInteriorPointInterface
 from parapint.linalg.base_linear_solver_interface import LinearSolverInterface
+from parapint.linalg.schur_complement.explicit_schur_complement import SchurComplementLinearSolver
 from typing import Optional
 from pyomo.common.config import ConfigDict, ConfigValue, PositiveFloat, NonNegativeInt, NonNegativeFloat
 
@@ -366,42 +368,137 @@ def numeric_factorization(interface: BaseInteriorPointInterface,
         if status not in {LinearSolverStatus.successful, LinearSolverStatus.singular}:
             raise RuntimeError('Could not factorize KKT system; linear solver status: ' + str(status))
 
-        pos_eig, neg_eig, zero_eig = None, None, None
-        _iter = 0
-        while final_inertia_coef <= options.inertia_correction.max_coef:
-            if status == LinearSolverStatus.successful:
-                pos_eig, neg_eig, zero_eig = options.linalg.solver.get_inertia()
-            else:
-                pos_eig, neg_eig, zero_eig = None, None, None
-            logger.debug('{reg_iter:<10}{num_realloc:<10}{reg_coef:<10.2e}'
-                         '{pos_eig:<10}{neg_eig:<10}{zero_eig:<10}'
-                         '{status:<10}'.format(reg_iter=_iter, num_realloc=num_realloc, reg_coef=final_inertia_coef,
-                                               pos_eig=str(pos_eig), neg_eig=str(neg_eig), zero_eig=str(zero_eig),
-                                               status=str(status)))
-            if ((neg_eig == interface.n_eq_constraints() + interface.n_ineq_constraints()) and
-                (zero_eig == 0) and
-                (status == LinearSolverStatus.successful)):
-                break
-            if _iter == 0:
-                kkt = kkt.copy()
-            kkt = interface.regularize_equality_gradient(kkt=kkt, coef=-inertia_coef, copy_kkt=False)
-            kkt = interface.regularize_hessian(kkt=kkt, coef=inertia_coef, copy_kkt=False)
-            status, num_realloc = try_factorization_and_reallocation(kkt=kkt,
-                                                                     linear_solver=options.linalg.solver,
-                                                                     reallocation_factor=options.linalg.reallocation_factor,
-                                                                     max_iter=options.linalg.max_num_reallocations,
-                                                                     symbolic_or_numeric='numeric',
-                                                                     timer=timer)
-            final_inertia_coef = inertia_coef
-            inertia_coef *= options.inertia_correction.factor_increase
-            _iter += 1
+        if isinstance(interface, DistStochasticSchurComplementInteriorPointInterface):
+            final_inertia_coef = distributed_inertia_check_and_regularization(interface=interface,
+                                                                              kkt=kkt,
+                                                                              status=status,
+                                                                              options=options,
+                                                                              linear_solver=options.linalg.solver,
+                                                                              inertia_coef=inertia_coef,
+                                                                              final_inertia_coef=final_inertia_coef,
+                                                                              num_realloc=num_realloc,
+                                                                              timer=timer)
+        else:
+            final_inertia_coef = inertia_check_and_regularization(interface=interface,
+                                                                    kkt=kkt,
+                                                                    status=status,
+                                                                    options=options,
+                                                                    inertia_coef=inertia_coef,
+                                                                    final_inertia_coef=final_inertia_coef,
+                                                                    num_realloc=num_realloc,
+                                                                    timer=timer)
 
-        if ((neg_eig != interface.n_eq_constraints() + interface.n_ineq_constraints()) or
+    return final_inertia_coef
+
+
+def inertia_check_and_regularization(interface: BaseInteriorPointInterface,
+                                     kkt,
+                                     status: LinearSolverStatus,
+                                     options: IPOptions,
+                                     inertia_coef,
+                                     final_inertia_coef,
+                                     num_realloc,
+                                     timer: Optional[HierarchicalTimer] = None):
+    pos_eig, neg_eig, zero_eig = None, None, None
+    _iter = 0
+    while final_inertia_coef <= options.inertia_correction.max_coef:
+        if _iter == 0:
+            kkt = kkt.copy()
+        if status == LinearSolverStatus.successful:
+            pos_eig, neg_eig, zero_eig = options.linalg.solver.get_inertia()
+        else:
+            pos_eig, neg_eig, zero_eig = None, None, None
+        logger.debug('{reg_iter:<10}{num_realloc:<10}{reg_coef:<10.2e}'
+                        '{pos_eig:<10}{neg_eig:<10}{zero_eig:<10}'
+                        '{status:<10}'.format(reg_iter=_iter, num_realloc=num_realloc, reg_coef=final_inertia_coef,
+                                            pos_eig=str(pos_eig), neg_eig=str(neg_eig), zero_eig=str(zero_eig),
+                                            status=str(status)))
+        if ((neg_eig == interface.n_eq_constraints() + interface.n_ineq_constraints()) and
+            (zero_eig == 0) and
+            (status == LinearSolverStatus.successful)):
+            break
+        
+        kkt = interface.regularize_equality_gradient(kkt=kkt, coef=-inertia_coef, copy_kkt=False)
+        kkt = interface.regularize_hessian(kkt=kkt, coef=inertia_coef, copy_kkt=False)
+        status, num_realloc = try_factorization_and_reallocation(kkt=kkt,
+                                                                    linear_solver=options.linalg.solver,
+                                                                    reallocation_factor=options.linalg.reallocation_factor,
+                                                                    max_iter=options.linalg.max_num_reallocations,
+                                                                    symbolic_or_numeric='numeric',
+                                                                    timer=timer)
+        final_inertia_coef = inertia_coef
+        inertia_coef *= options.inertia_correction.factor_increase
+        _iter += 1
+    
+    if ((neg_eig != interface.n_eq_constraints() + interface.n_ineq_constraints()) or
             (zero_eig != 0) or
             (status != LinearSolverStatus.successful)):
             raise RuntimeError('Exceeded maximum inertia correciton')
 
     return final_inertia_coef
+
+
+
+def distributed_inertia_check_and_regularization(interface: DistStochasticSchurComplementInteriorPointInterface,
+                                                kkt,
+                                                status: LinearSolverStatus,
+                                                options: IPOptions,
+                                                linear_solver: SchurComplementLinearSolver,
+                                                inertia_coef,
+                                                final_inertia_coef,
+                                                num_realloc,
+                                                timer: Optional[HierarchicalTimer] = None):
+    pos_eig, neg_eig, zero_eig = None, None, None
+    _iter = 0
+    while final_inertia_coef <= options.inertia_correction.max_coef:
+        if _iter == 0:
+            kkt = kkt.copy()
+        if status == LinearSolverStatus.successful:
+            #pos_eig, neg_eig, zero_eig = linear_solver.get_inertia()
+            total_inertia, distributed_inertia = linear_solver.get_distributed_inertia()
+            pos_eig, neg_eig, zero_eig = total_inertia
+        else:
+            pos_eig, neg_eig, zero_eig = None, None, None
+        logger.debug('{reg_iter:<10}{num_realloc:<10}{reg_coef:<10.2e}'
+                        '{pos_eig:<10}{neg_eig:<10}{zero_eig:<10}'
+                        '{status:<10}'.format(reg_iter=_iter, num_realloc=num_realloc, reg_coef=final_inertia_coef,
+                                            pos_eig=str(pos_eig), neg_eig=str(neg_eig), zero_eig=str(zero_eig),
+                                            status=str(status)))
+        if ((neg_eig == interface.n_eq_constraints() + interface.n_ineq_constraints()) and
+            (zero_eig == 0) and
+            (status == LinearSolverStatus.successful)):
+            break
+        
+        blocks_to_be_regularized = []
+        for ndx, inertia in distributed_inertia.items():
+            if ndx in interface._nlps.keys():
+                _pos, _neg, _zero = inertia
+                n_eq = interface._nlps[ndx].n_eq_constraints()
+                n_ineq = interface._nlps[ndx].n_ineq_constraints()
+                if _neg != n_eq + n_ineq or _zero != 0:
+                    blocks_to_be_regularized.append(ndx)
+
+        print(f'iter {_iter}, blocks_to_be_regularized: {blocks_to_be_regularized}')
+        kkt = interface.regularize_equality_gradient(kkt=kkt, coef=-inertia_coef, copy_kkt=False, block_indices=blocks_to_be_regularized)
+        kkt = interface.regularize_hessian(kkt=kkt, coef=inertia_coef, copy_kkt=False, block_indices=blocks_to_be_regularized)
+        status, num_realloc = try_factorization_and_reallocation(kkt=kkt,
+                                                                linear_solver=linear_solver,
+                                                                reallocation_factor=options.linalg.reallocation_factor,
+                                                                max_iter=options.linalg.max_num_reallocations,
+                                                                symbolic_or_numeric='numeric',
+                                                                timer=timer)
+        final_inertia_coef = inertia_coef
+        inertia_coef *= options.inertia_correction.factor_increase
+        _iter += 1
+    
+    if ((neg_eig != interface.n_eq_constraints() + interface.n_ineq_constraints()) or
+            (zero_eig != 0) or
+            (status != LinearSolverStatus.successful)):
+            raise RuntimeError('Exceeded maximum inertia correciton')
+
+    return final_inertia_coef
+
+
 
 
 def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,

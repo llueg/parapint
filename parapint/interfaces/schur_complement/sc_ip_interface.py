@@ -1740,6 +1740,7 @@ class StochasticSchurComplementInteriorPointInterface(BaseInteriorPointInterface
             nlp.regularize_equality_gradient(kkt=kkt.get_block(ndx, ndx).get_block(0, 0),
                                              coef=coef,
                                              copy_kkt=False)
+            # NOTE: This regularization should not be needed, as linking matrices always have full col. rank
             ptb = coef * identity(self._num_first_stage_vars_by_scenario[ndx], format='coo')
             kkt.get_block(ndx, ndx).set_block(1, 1, ptb)
         return kkt
@@ -1748,10 +1749,10 @@ class StochasticSchurComplementInteriorPointInterface(BaseInteriorPointInterface
         if copy_kkt:
             kkt = kkt.copy()
         for ndx, nlp in self._nlps.items():
-            # TODO: I think we don't need the second get block, as this is done inside regularize_hessian?
             nlp.regularize_hessian(kkt=kkt.get_block(ndx, ndx).get_block(0, 0),
                                    coef=coef,
                                    copy_kkt=False)
+        #NOTE: Is this regularization needed, if local complicating variables were already regularized above?
         block = kkt.get_block(self._num_scenarios, self._num_scenarios)
         ptb = coef * identity(block.shape[0], format='coo')
         kkt.set_block(self._num_scenarios, self._num_scenarios, ptb)

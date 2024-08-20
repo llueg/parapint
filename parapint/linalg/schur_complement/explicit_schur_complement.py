@@ -164,6 +164,28 @@ class SchurComplementLinearSolver(LinearSolverInterface):
         num_zero += _zero
 
         return num_pos, num_neg, num_zero
+    
+    def get_distributed_inertia(self):
+        num_pos = 0
+        num_neg = 0
+        num_zero = 0
+
+        distributed_inertia = {}
+
+        for ndx in range(self.block_dim - 1):
+            _pos, _neg, _zero = self.subproblem_solvers[ndx].get_inertia()
+            distributed_inertia[ndx] = (_pos, _neg, _zero)
+            num_pos += _pos
+            num_neg += _neg
+            num_zero += _zero
+        _pos, _neg, _zero = self.schur_complement_solver.get_inertia()
+        num_pos += _pos
+        num_neg += _neg
+        num_zero += _zero
+
+        total_inertia = num_pos, num_neg, num_zero
+
+        return total_inertia, distributed_inertia
 
     def increase_memory_allocation(self, factor):
         for ndx, sub_solver in self.subproblem_solvers.items():

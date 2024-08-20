@@ -326,6 +326,36 @@ class MPISchurComplementLinearSolver(LinearSolverInterface):
         num_zero += _zero
 
         return num_pos, num_neg, num_zero
+    
+    def get_distributed_inertia(self):
+        num_pos = 0
+        num_neg = 0
+        num_zero = 0
+
+        distributed_inertia = {}
+
+        for ndx in self.local_block_indices:
+            _pos, _neg, _zero = self.subproblem_solvers[ndx].get_inertia()
+            distributed_inertia[ndx] = (_pos, _neg, _zero)
+            num_pos += _pos
+            num_neg += _neg
+            num_zero += _zero
+        
+        num_pos = comm.allreduce(num_pos)
+        num_neg = comm.allreduce(num_neg)
+        num_zero = comm.allreduce(num_zero)
+
+        _pos, _neg, _zero = self.schur_complement_solver.get_inertia()
+        num_pos += _pos
+        num_neg += _neg
+        num_zero += _zero
+
+        all_distributed_inertia = comm.allgather(distributed_inertia)
+        combined_distributed_inertia = {k: v for d in all_distributed_inertia for k, v in d.items()}
+
+        total_inertia = num_pos, num_neg, num_zero
+
+        return total_inertia, combined_distributed_inertia
 
     def increase_memory_allocation(self, factor):
         """
