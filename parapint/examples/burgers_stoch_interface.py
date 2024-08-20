@@ -37,9 +37,9 @@ class Args(object):
 
     def parse_arguments(self):
         parser = argparse.ArgumentParser()
-        parser.add_argument('--nfe_x', type=int, required=True, help='number of finite elements for x')
-        parser.add_argument('--nfe_t', type=int, required=True, help='number of finite elements for t')
-        parser.add_argument('--nblocks', type=int, required=True, help='number of time blocks for schur complement')
+        parser.add_argument('--nfe_x', type=int, required=False, default=50, help='number of finite elements for x')
+        parser.add_argument('--nfe_t', type=int, required=False, default=200, help='number of finite elements for t')
+        parser.add_argument('--nblocks', type=int, required=False, default=4, help='number of time blocks for schur complement')
         parser.add_argument('--no_plot', action='store_true')
         parser.add_argument('--no_show_plot', action='store_true')
         args = parser.parse_args()
@@ -57,7 +57,7 @@ class BurgersInterface(parapint.interfaces.MPIStochasticSchurComplementInteriorP
         self.last_t = None
         self.scenarios = list(range(num_time_blocks))
         self.delta_t = (end_t - start_t) / num_time_blocks
-        x_indices = np.round(np.linspace(0, 1, nfe_x + 1), 2)[1:-1].tolist()
+        x_indices = np.round(np.linspace(0, 1, nfe_x + 1), 3)[1:-1].tolist()
 
         first_stage_var_ids = [('y', (x, i*self.delta_t)) for i in range(1, num_time_blocks)for x in x_indices] + \
                                 [('u', (x, i*self.delta_t)) for i in range(1, num_time_blocks) for x in x_indices]
@@ -90,10 +90,11 @@ class BurgersInterface(parapint.interfaces.MPIStochasticSchurComplementInteriorP
         m.u = pe.Var(m.x, m.t)
 
         def _y_init_rule(m, x):
-            if x <= 0.5 * end_x:
-                return 1
-                #return np.cos(2 * np.pi * x)
-            return 0
+            return np.cos(2 * np.pi * x)
+            # if x <= 0.5 * end_x:
+            #     return 1
+            #     #return np.cos(2 * np.pi * x)
+            # return 0
 
         m.y0 = pe.Param(m.x, default=_y_init_rule)
 
@@ -286,9 +287,24 @@ def main(args, subproblem_solver_class, subproblem_solver_options):
                                  num_time_blocks=args.nblocks,
                                  nfe_t=args.nfe_t,
                                  nfe_x=args.nfe_x)
-    linear_solver = parapint.linalg.MPISchurComplementLinearSolver(
+    
+    pcg_options = parapint.linalg.PcgOptions()
+    precond_options = {}
+    options = {'pcg': pcg_options, 'preconditioner': precond_options}
+    # linear_solver = parapint.linalg.MPISpiluImplicitSchurComplementLinearSolver(
+    #     subproblem_solvers={ndx: subproblem_solver_class(**subproblem_solver_options) for ndx in range(args.nblocks)},
+    #     options = options
+    #     )
+
+    linear_solver = parapint.linalg.MPIASNoOverlapImplicitSchurComplementLinearSolver(
         subproblem_solvers={ndx: subproblem_solver_class(**subproblem_solver_options) for ndx in range(args.nblocks)},
-        schur_complement_solver=subproblem_solver_class(**subproblem_solver_options))
+        local_schur_complement_solvers={ndx: subproblem_solver_class(**subproblem_solver_options) for ndx in range(args.nblocks)},
+        options=options
+    )
+
+    # linear_solver = parapint.linalg.MPISchurComplementLinearSolver(
+    #     subproblem_solvers={ndx: subproblem_solver_class(**subproblem_solver_options) for ndx in range(args.nblocks)},
+    #     schur_complement_solver=subproblem_solver_class(**subproblem_solver_options))
     options = parapint.algorithms.IPOptions()
     options.linalg.solver = linear_solver
     status = parapint.algorithms.ip_solve(interface=interface, options=options)

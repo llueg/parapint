@@ -51,9 +51,9 @@ class PcgOptions(ConfigDict):
         self.declare('rtol', ConfigValue(domain=PositiveFloat))
         self.declare('lbfgs_approx_options', LbfgsApproxOptions())
 
-        self.max_iter: int | None = None
-        self.atol: float = 1e-6
-        self.rtol: float = 1e-6
+        self.max_iter: int | None = 1000
+        self.atol: float = 1e-8
+        self.rtol: float = 1e-8
         self.lbfgs_approx_options = LbfgsApproxOptions()
 
 

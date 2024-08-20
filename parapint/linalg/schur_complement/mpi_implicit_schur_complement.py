@@ -31,6 +31,7 @@ class MPISchurComplementUtilMixin:
         self.local_block_indices = list()
         self._local_block_indices_for_numeric_factorization = list()
         self.schur_complement = coo_matrix((0, 0))
+        self._current_schur_complement = coo_matrix((0, 0))
         self.border_matrices: Dict[int, _BorderMatrix] = dict()
         self.sc_data_slices = dict()
     
@@ -97,7 +98,8 @@ class MPISchurComplementUtilMixin:
         comm.Allreduce(self.schur_complement.data, sc)
         timer.stop('Allreduce')
         self.schur_complement.data = sc
-        self.schur_complement = self.schur_complement + self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
+        #self.schur_complement = self.schur_complement + self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
+        self._current_schur_complement = self.schur_complement + self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
         timer.stop('communicate')
         timer.stop('form SC')
 
@@ -220,7 +222,7 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
                                  timer: HierarchicalTimer
                                  ) -> LinearSolverResults:
         if self._flag_factorize_sc:
-            res = self._symbolic_numeric_factorize_sc(self.schur_complement, self.sc_solver, timer)
+            res = self._symbolic_numeric_factorize_sc(self._current_schur_complement, self.sc_solver, timer)
         else:
             res = LinearSolverResults()
             res.status = LinearSolverStatus.successful
@@ -298,21 +300,29 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
         if timer is None:
             timer = HierarchicalTimer()
         timer.start('back_solve')
-
-        schur_complement_rhs = np.zeros(rhs.get_block(self.block_dim - 1).size, dtype='d')
+        sc_dim = rhs.get_block(self.block_dim - 1).size
+        schur_complement_rhs = np.zeros(sc_dim, dtype='d')
         for ndx in self.local_block_indices:
             A = self.block_matrix.get_block(self.block_dim-1, ndx)
             contribution = self.subproblem_solvers[ndx].do_back_solve(rhs.get_block(ndx))
             schur_complement_rhs -= A.tocsr().dot(contribution.flatten())
-        res = np.zeros(rhs.get_block(self.block_dim - 1).shape[0], dtype='d')
+        res = np.zeros(sc_dim, dtype='d')
         comm.Allreduce(schur_complement_rhs, res)
         schur_complement_rhs = rhs.get_block(self.block_dim - 1) + res
+
+        SC_linop = scipy.sparse.linalg.LinearOperator(shape=(sc_dim, sc_dim),
+                                               matvec=lambda u: self._sc_matvec(u, timer),
+                                               dtype='d')
+        M_linop = scipy.sparse.linalg.LinearOperator(shape=(sc_dim, sc_dim),
+                                               matvec=lambda r: self._apply_preconditioner(r),
+                                               dtype='d')
         
-        pcg_sol: PcgSolution = pcg_solve(A=lambda u: self._sc_matvec(u, timer),
+        pcg_sol: PcgSolution = pcg_solve(A=SC_linop,
                                          b=schur_complement_rhs,
-                                         M=lambda r: self._apply_preconditioner(r),
+                                         M=M_linop,
                                          pcg_options=self.pcg_options)
         coupling = pcg_sol.x
+        print('Number of iterations: ', pcg_sol.num_iterations)
         self._update_preconditioner(pcg_sol)
 
 
@@ -454,8 +464,11 @@ class MPISpiluImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComplement
     def _apply_preconditioner(self, r: NDArray) -> NDArray:
         return self._spilu_precond.solve(r)
 
-    def _factorize_sc_components(self, timer: HierarchicalTimer):
+    def _factorize_sc_components(self, timer: HierarchicalTimer) -> LinearSolverResults:
         timer.start('SpILU SC')
-        self._spilu_precond = scipy.sparse.linalg.spilu(self.schur_complement.tocsc())
+        self._spilu_precond = scipy.sparse.linalg.spilu(self._current_schur_complement.tocsc())
         timer.stop('SpILU SC')
+        res = LinearSolverResults()
+        res.status = LinearSolverStatus.successful
+        return res
 

@@ -24,15 +24,15 @@ class MPIASNoOverlapImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComp
 
     def __init__(self,
                  subproblem_solvers: Dict[int, LinearSolverInterface],
-                 local_schur_complinear_solvers: Dict[int, LinearSolverInterface],
+                 local_schur_complement_solvers: Dict[int, LinearSolverInterface],
                  options: Dict):
         super().__init__(subproblem_solvers=subproblem_solvers, options=options)
         self._flag_form_sc = False
         self._flag_factorize_sc = False
 
-        self.local_schur_complement_solvers: Dict[int, LinearSolverInterface] = local_schur_complinear_solvers
+        self.local_schur_complement_solvers: Dict[int, LinearSolverInterface] = local_schur_complement_solvers
         self.local_schur_complements: Dict[int, NDArray | sps.coo_array] = dict()
-
+        self.debug = False
 
     def _check_if_block_indices_local(self, block_indices: List[int]) -> None:
         for i in block_indices:
@@ -42,11 +42,13 @@ class MPIASNoOverlapImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComp
                             timer: HierarchicalTimer
                             ) -> None:
 
+        sc_dim = self.block_matrix.get_row_size(self.block_dim - 1)
+        self.weighting_matrix = np.zeros(sc_dim, dtype=np.double)
         for ndx in self._local_block_indices_for_numeric_factorization:
             border_matrix: _BorderMatrix = self.border_matrices[ndx]
             local_sc_dim = border_matrix.num_nonzero_rows
             self.local_schur_complements[ndx] = np.zeros((local_sc_dim, local_sc_dim), dtype=np.double)
-
+            self.weighting_matrix[self.border_matrices[ndx].nonzero_rows] += 1
             A = border_matrix.csr
             Ar = border_matrix._get_reduced_matrix()
             _rhs = np.zeros(A.shape[1], dtype=np.double)
@@ -79,12 +81,31 @@ class MPIASNoOverlapImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComp
             timer.start('convert_to_coo')
             self.local_schur_complements[ndx] = sps.coo_array(self.local_schur_complements[ndx])
             timer.stop('convert_to_coo')
+        
+        self.weighting_matrix = comm.allreduce(self.weighting_matrix)
+        self.weighting_matrix = 1/self.weighting_matrix
+        #self.weighting_matrix = np.ones_like(self.weighting_matrix)
+
+        if self.debug:
+            self._form_full_sc(timer)
+            assembled_sc = np.zeros_like(self.schur_complement.todense())
+            for ndx in self._local_block_indices_for_numeric_factorization:
+                border_matrix: _BorderMatrix = self.border_matrices[ndx]
+                Nk = border_matrix._get_selection_matrix()
+                assembled_sc += Nk @ self.local_schur_complements[ndx] @ Nk.T
+            
+            assembled_sc = comm.allreduce(assembled_sc)
+            diff = np.linalg.norm(assembled_sc - self.schur_complement.todense())
+            if diff > 1e-10:
+                print(f"Diff in SC: {diff}")
+                #raise RuntimeError("Diff in SC")
 
     def _factorize_sc_components(self,
                                  timer: HierarchicalTimer
                                  ) -> LinearSolverResults:
         res = LinearSolverResults()
         res.status = LinearSolverStatus.successful
+        timer.start('factor_SC')
         for ndx in self._local_block_indices_for_numeric_factorization:
             sub_res = self.local_schur_complement_solvers[ndx].do_symbolic_factorization(self.local_schur_complements[ndx], raise_on_error=False)
             _process_sub_results(res, sub_res)
@@ -108,6 +129,9 @@ class MPIASNoOverlapImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComp
 
         timer.stop('build_border_matrices')
 
+        if self.debug:
+            self._get_full_sc_structure(block_matrix, timer)
+
     def _update_preconditioner(self, pcg_sol: PcgSolution):
         pass
         
@@ -118,9 +142,9 @@ class MPIASNoOverlapImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComp
         result = np.zeros_like(r)
         for ndx in self.local_block_indices:
             n_mat = self.border_matrices[ndx]._get_selection_matrix()
-            r_local = n_mat.transpose().dot(r)
+            r_local = n_mat.transpose().dot(self.weighting_matrix * r)
             x_local = self.local_schur_complement_solvers[ndx].do_back_solve(r_local)
-            result += n_mat.dot(x_local)
+            result += self.weighting_matrix * n_mat.dot(x_local)
 
         result = comm.allreduce(result)
 
