@@ -4,7 +4,7 @@ import enum
 from scipy.sparse.linalg._isolve.utils import make_system
 from scipy.optimize import LbfgsInvHessProduct
 from typing import Dict, Tuple
-from pyomo.common.config import ConfigDict, ConfigValue, PositiveFloat, NonNegativeInt, NonNegativeFloat, InEnum
+from pyomo.common.config import ConfigDict, ConfigValue, PositiveFloat, NonNegativeInt, NonNegativeFloat, InEnum, Bool
 from dataclasses import dataclass
 
 class LbfgsSamplingOptions(enum.Enum):
@@ -29,9 +29,11 @@ class LbfgsApproxOptions(ConfigDict):
         self.declare('m', ConfigValue(domain=NonNegativeInt))
         # TODO: not sure if this is the intended usage
         self.declare('sampling', ConfigValue(domain=InEnum(LbfgsSamplingOptions)))
+        self.declare('distributed', ConfigValue(domain=Bool))
 
         self.m: int = 11
         self.sampling = LbfgsSamplingOptions.disable
+        self.distributed: bool = False
 
 class PcgOptions(ConfigDict):
 
@@ -51,7 +53,7 @@ class PcgOptions(ConfigDict):
         self.declare('rtol', ConfigValue(domain=PositiveFloat))
         self.declare('lbfgs_approx_options', LbfgsApproxOptions())
 
-        self.max_iter: int | None = 1000
+        self.max_iter: int = 1000
         self.atol: float = 1e-8
         self.rtol: float = 1e-8
         self.lbfgs_approx_options = LbfgsApproxOptions()
@@ -76,6 +78,7 @@ class LbfgsInvHessCollector:
         self._sampling_strategy = approx_options.sampling
         self._m = approx_options.m
         self._dim = dim
+        self._last_hess_approx: LbfgsInvHessProduct | None = None
 
         if approx_options.sampling == LbfgsSamplingOptions.uniform:
             # use first m-1 for uniform samples, last for current
@@ -98,6 +101,13 @@ class LbfgsInvHessCollector:
 
     def pop_inv_hessian_approx(self):
         assert self._counter > 0, 'No samples have been collected yet.'
+        if self._counter <= 0:
+            if self._last_hess_approx is not None:
+                print('Warning: No PCG samples have been collected, returning last available Hess. approx.')
+                ret = self._last_hess_approx  
+            else:
+                print('Warning: No PCG samples have been collected, returning Identity Hess. approx.')
+                ret = np.eye(self._dim)
         if self._counter < self._m:
             ret = LbfgsInvHessProduct(self._sk[:self._counter], self._yk[:self._counter])
         elif (self._sampling_strategy == LbfgsSamplingOptions.uniform and self._counter == self._k_indxs[-1] + 1):
@@ -106,6 +116,7 @@ class LbfgsInvHessCollector:
         else:
             ret = LbfgsInvHessProduct(self._sk, self._yk)
         self._reset()
+        self._last_hess_approx = ret
         return ret
     
     def update(self, s, y) -> None:
@@ -148,7 +159,7 @@ class LbfgsInvHessCollector:
 
 
 def pcg_solve(A, b, x0=None, M=None, pcg_options: PcgOptions = PcgOptions(),
-        callback=None) -> PcgSolution:
+        callback=None, local_var_indices=None) -> PcgSolution:
     """Adaptation of scipy.sparse.linalg.cg with addition of lbfgs hessian approximation
     and termination for negative curvature
 
@@ -158,8 +169,13 @@ def pcg_solve(A, b, x0=None, M=None, pcg_options: PcgOptions = PcgOptions(),
     rtol = pcg_options.rtol
     hess_approx_options = pcg_options.lbfgs_approx_options
     if hess_approx_options.sampling != LbfgsSamplingOptions.disable:
-        inv_hess_collector = LbfgsInvHessCollector(hess_approx_options, len(b))
-        collect = lambda s, y: inv_hess_collector.update(s, y)
+        if hess_approx_options.distributed:
+            assert local_var_indices is not None, 'Distributed hessian approximation requires local_var_indices'
+            inv_hess_collector = LbfgsInvHessCollector(hess_approx_options, len(local_var_indices))
+            collect = lambda s, y: inv_hess_collector.update(s[local_var_indices], y[local_var_indices])
+        else:
+            inv_hess_collector = LbfgsInvHessCollector(hess_approx_options, len(b))
+            collect = lambda s, y: inv_hess_collector.update(s, y)
         return_hess_approx = lambda : inv_hess_collector.pop_inv_hessian_approx()
     else:
         inv_hess_collector = None
@@ -175,11 +191,6 @@ def pcg_solve(A, b, x0=None, M=None, pcg_options: PcgOptions = PcgOptions(),
     if bnrm2 == 0:
         return PcgSolution(x=postprocess(x), status=PcgSolutionStatus.successful,
                            num_iterations=0, hess_approx=None)
-
-    n = len(b)
-
-    if maxiter is None:
-        maxiter = n*10
 
     dotprod = np.dot
 
