@@ -13,7 +13,8 @@ from parapint.linalg.base_linear_solver_interface import LinearSolverInterface
 from parapint.linalg.schur_complement.explicit_schur_complement import SchurComplementLinearSolver
 from typing import Optional
 from pyomo.common.config import ConfigDict, ConfigValue, PositiveFloat, NonNegativeInt, NonNegativeFloat
-
+from typing import List, Tuple, Dict
+import pandas as pd
 
 """
 Interface Requirements
@@ -26,6 +27,48 @@ Interface Requirements
 
 
 logger = logging.getLogger(__name__)
+
+
+class InteriorPointHistory:
+
+    def __init__(self, logger, filename=None):
+        self._header_fmt = {}
+        self._history = {}
+        self.logger = logger
+        self.filename = filename
+
+    # def add_iter_data(self, iter:int, **kwargs):
+    #     if iter not in self._history:
+    #         self._history[iter] = {}
+    #     for arg, width in self._iter_args:
+    #         self._history[iter][arg] = kwargs.pop(arg)
+        
+    def log_header(self, args: List[Tuple[str,int, str]]):
+        log_string = ''
+        for arg, width, fmt in args:
+            #log_string += f'{arg:<{width}}'
+            log_string += '{arg:<{width}}'.format(arg=arg, width=width)
+            self._header_fmt[arg] = (width, fmt)
+        self.logger.info(log_string)
+
+    def log_iter(self, **kwargs):
+        log_string = ''
+        for arg, (width, fmt) in self._header_fmt.items():
+            #log_string += f'{kwargs.get(arg, "na"):<{width}}'
+            log_string += '{arg:<{width}{fmt}}'.format(arg=kwargs.get(arg, "na"), width=width, fmt=fmt)
+        self.logger.info(log_string)
+        iter = kwargs.pop('iter')
+        if iter not in self._history:
+            self._history[iter] = {}
+        for arg in kwargs:
+            self._history[iter][arg] = kwargs.get(arg)
+    
+    def save(self):
+        if self.filename is not None:
+            df = pd.DataFrame.from_dict(self._history, orient='index')
+            df.index.name = 'iter'
+            df.to_csv(self.filename)
+
 
 
 class InteriorPointStatus(enum.Enum):
@@ -438,7 +481,6 @@ def inertia_check_and_regularization(interface: BaseInteriorPointInterface,
     return final_inertia_coef
 
 
-
 def distributed_inertia_check_and_regularization(interface: DistStochasticSchurComplementInteriorPointInterface,
                                                 kkt,
                                                 status: LinearSolverStatus,
@@ -500,7 +542,6 @@ def distributed_inertia_check_and_regularization(interface: DistStochasticSchurC
 
 
 
-
 def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
                                          kkt,
                                          options: IPOptions,
@@ -514,12 +555,16 @@ def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
                                                                   reg_coef='reg_coef', pos_eig='pos_eig',
                                                                   neg_eig='neg_eig', zero_eig='zero_eig',
                                                                   status='status'))
+    timer.start('factorize')
+    timer.start('numeric')
     status, num_realloc = try_factorization_and_reallocation(kkt=kkt,
                                                              linear_solver=options.linalg.solver,
                                                              reallocation_factor=options.linalg.reallocation_factor,
                                                              max_iter=options.linalg.max_num_reallocations,
                                                              symbolic_or_numeric='numeric',
                                                              timer=timer)
+    timer.stop('numeric')
+    timer.stop('factorize')
 
     final_inertia_coef = 0
     if not options.use_inertia_correction:
@@ -534,6 +579,7 @@ def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
         assert isinstance(options.linalg.solver, MPIBaseImplicitSchurComplementLinearSolver), 'Expected MPIBaseImplicitSchurComplementLinearSolver'
         solver: MPIBaseImplicitSchurComplementLinearSolver = options.linalg.solver
         delta, pcg_status = solver.do_back_solve(interface.evaluate_primal_dual_kkt_rhs())
+        num_pcg_iter = solver._current_pcg_solution.num_iterations
         timer.stop('back solve')
     else:
         if status not in {LinearSolverStatus.successful, LinearSolverStatus.singular}:
@@ -559,6 +605,7 @@ def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
                 solver: MPIBaseImplicitSchurComplementLinearSolver = options.linalg.solver
                 timer.start('back solve')
                 delta, pcg_status = solver.do_back_solve(interface.evaluate_primal_dual_kkt_rhs())
+                num_pcg_iter = solver._current_pcg_solution.num_iterations
                 timer.stop('back solve')
                 if pcg_status == PcgSolutionStatus.negative_curvature:
                     pass
@@ -569,12 +616,16 @@ def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
                 kkt = kkt.copy()
             kkt = interface.regularize_equality_gradient(kkt=kkt, coef=-inertia_coef, copy_kkt=False)
             kkt = interface.regularize_hessian(kkt=kkt, coef=inertia_coef, copy_kkt=False)
+            timer.start('factorize')
+            timer.start('numeric')
             status, num_realloc = try_factorization_and_reallocation(kkt=kkt,
                                                                      linear_solver=options.linalg.solver,
                                                                      reallocation_factor=options.linalg.reallocation_factor,
                                                                      max_iter=options.linalg.max_num_reallocations,
                                                                      symbolic_or_numeric='numeric',
                                                                      timer=timer)
+            timer.stop('numeric')
+            timer.stop('factorize')
             final_inertia_coef = inertia_coef
             inertia_coef *= options.inertia_correction.factor_increase
             _iter += 1
@@ -584,7 +635,7 @@ def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
             (status != LinearSolverStatus.successful)):
             raise RuntimeError('Exceeded maximum inertia correciton')
 
-    return delta, final_inertia_coef
+    return delta, final_inertia_coef, num_pcg_iter
 
 
 
@@ -638,27 +689,41 @@ def ip_solve(interface: BaseInteriorPointInterface,
     alpha_dual_max = 1
     alpha = 1
 
-    logger.info('{_iter:<6}'
-                '{objective:<11}'
-                '{primal_inf:<11}'
-                '{dual_inf:<11}'
-                '{compl_inf:<11}'
-                '{barrier:<11}'
-                '{alpha_p:<11}'
-                '{alpha_d:<11}'
-                '{alpha:<11}'
-                '{reg:<11}'
-                '{time:<7}'.format(_iter='Iter',
-                                   objective='Objective',
-                                   primal_inf='Prim Inf',
-                                   dual_inf='Dual Inf',
-                                   compl_inf='Comp Inf',
-                                   barrier='Barrier',
-                                   alpha_p='Prim Step',
-                                   alpha_d='Dual Step',
-                                   alpha='LS Step',
-                                   reg='Reg',
-                                   time='Time'))
+    # logger.info('{_iter:<6}'
+    #             '{objective:<11}'
+    #             '{primal_inf:<11}'
+    #             '{dual_inf:<11}'
+    #             '{compl_inf:<11}'
+    #             '{barrier:<11}'
+    #             '{alpha_p:<11}'
+    #             '{alpha_d:<11}'
+    #             '{alpha:<11}'
+    #             '{reg:<11}'
+    #             '{time:<7}'.format(_iter='Iter',
+    #                                objective='Objective',
+    #                                primal_inf='Prim Inf',
+    #                                dual_inf='Dual Inf',
+    #                                compl_inf='Comp Inf',
+    #                                barrier='Barrier',
+    #                                alpha_p='Prim Step',
+    #                                alpha_d='Dual Step',
+    #                                alpha='LS Step',
+    #                                reg='Reg',
+    #                                time='Time'))
+    
+    if isinstance(options.linalg.solver, MPIBaseImplicitSchurComplementLinearSolver):
+        aux_logging_vars = [('pcg_iters', 10, '')]
+        aux_logging_data = {'pcg_iters': 'na'}
+    else:
+        aux_logging_vars = []
+        aux_logging_data = {}
+
+    logging_vars = [('iter', 6, ''), ('objective', 11, '.2e'), ('primal_inf', 11, '.2e'), ('dual_inf', 11, '.2e'), ('compl_inf', 11, '.2e'),
+                    ('barrier', 11, '.2e'), ('alpha_p', 11, '.2e'), ('alpha_d', 11, '.2e'), ('alpha', 11, '.2e'), ('reg', 11, '.2e'), ('time', 7, '.3f')]
+    
+    ip_history = InteriorPointHistory(logger, filename='ip_history.csv')
+    ip_history.log_header(logging_vars + aux_logging_vars)
+
 
     timer.stop('init')
     status = InteriorPointStatus.error
@@ -677,27 +742,30 @@ def ip_solve(interface: BaseInteriorPointInterface,
         primal_inf, dual_inf, complimentarity_inf = check_convergence(interface=interface, barrier=0, error_scaling=options.error_scaling, timer=timer)
         timer.stop('convergence check')
         objective = interface.evaluate_objective()
-        logger.info('{_iter:<6}'
-                    '{objective:<11.2e}'
-                    '{primal_inf:<11.2e}'
-                    '{dual_inf:<11.2e}'
-                    '{compl_inf:<11.2e}'
-                    '{barrier:<11.2e}'
-                    '{alpha_p:<11.2e}'
-                    '{alpha_d:<11.2e}'
-                    '{alpha:<11.2e}'
-                    '{reg:<11.2e}'
-                    '{time:<7.3f}'.format(_iter=_iter,
-                                          objective=objective,
-                                          primal_inf=primal_inf,
-                                          dual_inf=dual_inf,
-                                          compl_inf=complimentarity_inf,
-                                          barrier=barrier_parameter,
-                                          alpha_p=alpha_primal_max,
-                                          alpha_d=alpha_dual_max,
-                                          alpha=alpha,
-                                          reg=used_inertia_coef,
-                                          time=time.time() - t0))
+        # logger.info('{_iter:<6}'
+        #             '{objective:<11.2e}'
+        #             '{primal_inf:<11.2e}'
+        #             '{dual_inf:<11.2e}'
+        #             '{compl_inf:<11.2e}'
+        #             '{barrier:<11.2e}'
+        #             '{alpha_p:<11.2e}'
+        #             '{alpha_d:<11.2e}'
+        #             '{alpha:<11.2e}'
+        #             '{reg:<11.2e}'
+        #             '{time:<7.3f}'.format(_iter=_iter,
+        #                                   objective=objective,
+        #                                   primal_inf=primal_inf,
+        #                                   dual_inf=dual_inf,
+        #                                   compl_inf=complimentarity_inf,
+        #                                   barrier=barrier_parameter,
+        #                                   alpha_p=alpha_primal_max,
+        #                                   alpha_d=alpha_dual_max,
+        #                                   alpha=alpha,
+        #                                   reg=used_inertia_coef,
+        #                                   time=time.time() - t0))
+        ip_history.log_iter(iter=_iter, objective=objective, primal_inf=primal_inf, dual_inf=dual_inf,
+                            compl_inf=complimentarity_inf, barrier=barrier_parameter, alpha_p=alpha_primal_max,
+                            alpha_d=alpha_dual_max, alpha=alpha, reg=used_inertia_coef, time=time.time() - t0, **aux_logging_data)
 
         if max(primal_inf, dual_inf, complimentarity_inf) <= options.tol:
             status = InteriorPointStatus.optimal
@@ -724,8 +792,9 @@ def ip_solve(interface: BaseInteriorPointInterface,
         timer.stop('eval')
 
         # Factorize linear system
-        timer.start('factorize')
+
         if _iter == 0:
+            timer.start('factorize')
             timer.start('symbolic')
             sym_fact_status, sym_fact_iter = try_factorization_and_reallocation(kkt=kkt,
                                                                                 linear_solver=options.linalg.solver,
@@ -734,17 +803,19 @@ def ip_solve(interface: BaseInteriorPointInterface,
                                                                                 symbolic_or_numeric='symbolic',
                                                                                 timer=timer)
             timer.stop('symbolic')
+            timer.stop('factorize')
             if sym_fact_status != LinearSolverStatus.successful:
                 raise RuntimeError('Could not factorize KKT system; linear solver status: ' + str(sym_fact_status))
         
         if isinstance(options.linalg.solver, MPIBaseImplicitSchurComplementLinearSolver):
-            delta, used_inertia_coef = numeric_factorization_and_back_solve(interface=interface,
+            delta, used_inertia_coef, num_pcg_iter = numeric_factorization_and_back_solve(interface=interface,
                                                                             kkt=kkt,
                                                                             options=options,
                                                                             inertia_coef=inertia_coef,
                                                                             timer=timer)
-            timer.stop('factorize')
+            aux_logging_data['pcg_iters'] = num_pcg_iter
         else:
+            timer.start('factorize')
             timer.start('numeric')
             used_inertia_coef = numeric_factorization(interface=interface,
                                                     kkt=kkt,
@@ -823,6 +894,9 @@ def ip_solve(interface: BaseInteriorPointInterface,
     timer.stop('IP solve')
     if options.report_timing:
         print(timer)
+
+    ip_history.save()
+
     return status
 
 

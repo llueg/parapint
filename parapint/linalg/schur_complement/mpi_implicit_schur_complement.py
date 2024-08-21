@@ -342,8 +342,8 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
                                          local_var_indices=local_var_indices)
         coupling = pcg_sol.x
         self._current_pcg_solution = pcg_sol
-        if rank == 0:
-            print('# PCG iterations: ', pcg_sol.num_iterations)
+        # if rank == 0:
+        #     print('# PCG iterations: ', pcg_sol.num_iterations)
         self._update_preconditioner(pcg_sol)
 
 
