@@ -6,6 +6,7 @@ from parapint.linalg.results import LinearSolverStatus
 from parapint.linalg.iterative.pcg import PcgSolutionStatus
 from parapint.linalg.schur_complement.mpi_implicit_schur_complement import MPIBaseImplicitSchurComplementLinearSolver
 from pyomo.common.timing import HierarchicalTimer
+from parapint.utils import MPIHierarchicalTimer, TimerCollection
 import enum
 from parapint.interfaces.interface import BaseInteriorPointInterface
 from parapint.interfaces.distributed_regularization import MPIDistStochasticSchurComplementInteriorPointInterface, DistStochasticSchurComplementInteriorPointInterface
@@ -31,11 +32,11 @@ logger = logging.getLogger(__name__)
 
 class InteriorPointHistory:
 
-    def __init__(self, logger, filename=None):
+    def __init__(self, logger):
         self._header_fmt = {}
         self._history = {}
         self.logger = logger
-        self.filename = filename
+        self.timer: MPIHierarchicalTimer = None
 
     # def add_iter_data(self, iter:int, **kwargs):
     #     if iter not in self._history:
@@ -63,11 +64,11 @@ class InteriorPointHistory:
         for arg in kwargs:
             self._history[iter][arg] = kwargs.get(arg)
     
-    def save(self):
-        if self.filename is not None:
+    def save(self, filename=None):
+        if filename is not None:
             df = pd.DataFrame.from_dict(self._history, orient='index')
             df.index.name = 'iter'
-            df.to_csv(self.filename)
+            df.to_csv(filename)
 
 
 
@@ -641,7 +642,8 @@ def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
 
 def ip_solve(interface: BaseInteriorPointInterface,
              options: Optional[IPOptions] = None,
-             timer: Optional[HierarchicalTimer] = None) -> InteriorPointStatus:
+             timer: Optional[HierarchicalTimer] = None
+             ) -> Tuple[InteriorPointStatus, InteriorPointHistory]:
     """
     Parameters
     ----------
@@ -655,7 +657,7 @@ def ip_solve(interface: BaseInteriorPointInterface,
         options = IPOptions()
 
     if timer is None:
-        timer = HierarchicalTimer()
+        timer = MPIHierarchicalTimer()
 
     timer.start('IP solve')
     timer.start('init')
@@ -721,7 +723,7 @@ def ip_solve(interface: BaseInteriorPointInterface,
     logging_vars = [('iter', 6, ''), ('objective', 11, '.2e'), ('primal_inf', 11, '.2e'), ('dual_inf', 11, '.2e'), ('compl_inf', 11, '.2e'),
                     ('barrier', 11, '.2e'), ('alpha_p', 11, '.2e'), ('alpha_d', 11, '.2e'), ('alpha', 11, '.2e'), ('reg', 11, '.2e'), ('time', 7, '.3f')]
     
-    ip_history = InteriorPointHistory(logger, filename='ip_history.csv')
+    ip_history = InteriorPointHistory(logger)
     ip_history.log_header(logging_vars + aux_logging_vars)
 
 
@@ -892,12 +894,11 @@ def ip_solve(interface: BaseInteriorPointInterface,
         duals_slacks_ub += alpha * delta_duals_slacks_ub
 
     timer.stop('IP solve')
+    ip_history.timer = timer
     if options.report_timing:
         print(timer)
 
-    ip_history.save()
-
-    return status
+    return status, ip_history
 
 
 def try_factorization_and_reallocation(kkt, linear_solver: LinearSolverInterface, reallocation_factor, max_iter,

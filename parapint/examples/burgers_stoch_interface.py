@@ -9,6 +9,8 @@ from mpi4py import MPI
 import math
 import logging
 import argparse
+import pickle
+from typing import List, Tuple, Dict
 
 
 """
@@ -666,15 +668,23 @@ def main(args, subproblem_solver_class, subproblem_solver_options):
     #     options=options
     # )
 
-    linear_solver = parapint.linalg.MPISchurComplementLinearSolver(
-        subproblem_solvers={ndx: subproblem_solver_class(**subproblem_solver_options) for ndx in range(args.nblocks)},
-        schur_complement_solver=subproblem_solver_class(**subproblem_solver_options))
+    # linear_solver = parapint.linalg.MPISchurComplementLinearSolver(
+    #     subproblem_solvers={ndx: subproblem_solver_class(**subproblem_solver_options) for ndx in range(args.nblocks)},
+    #     schur_complement_solver=subproblem_solver_class(**subproblem_solver_options))
 
     options = parapint.algorithms.IPOptions()
     options.linalg.solver = linear_solver
-    status = parapint.algorithms.ip_solve(interface=interface, options=options)
+    status, history = parapint.algorithms.ip_solve(interface=interface, options=options)
     assert status == parapint.algorithms.InteriorPointStatus.optimal
     interface.load_primals_into_pyomo_model()
+
+    from parapint.utils import MPIHierarchicalTimer, TimerCollection
+    timer_list: List[MPIHierarchicalTimer] = comm.gather(history.timer, root=0)
+    if rank == 0:
+        history.save('ip_log.csv')
+        timer_collection = TimerCollection(timer_list)
+        with open(f'timers.pickle', 'wb') as f:
+            pickle.dump(timer_collection, f)
 
     if args.plot:
         interface.plot_results(show_plot=args.show_plot)
