@@ -142,9 +142,11 @@ class MPIASNoOverlapImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComp
         result = np.zeros_like(r)
         for ndx in self.local_block_indices:
             n_mat = self.border_matrices[ndx]._get_selection_matrix()
-            r_local = n_mat.transpose().dot(self.weighting_matrix * r)
+            #r_local = n_mat.transpose().dot(self.weighting_matrix * r)
+            r_local = n_mat.transpose().dot(r)
             x_local = self.local_schur_complement_solvers[ndx].do_back_solve(r_local)
-            result += self.weighting_matrix * n_mat.dot(x_local)
+            #result += self.weighting_matrix * n_mat.dot(x_local)
+            result += n_mat.dot(x_local)
 
         result = comm.allreduce(result)
 
@@ -209,6 +211,13 @@ class MPIASNoOverlapImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComp
 
 class MPIASWithOverlapImplicitSchurComplementLinearSolver(MPIASNoOverlapImplicitSchurComplementLinearSolver):
 
+
+    def _get_sc_structure(self,
+                          block_matrix: MPIBlockMatrix,
+                          timer: HierarchicalTimer
+                          ) -> None:
+        self._get_full_sc_structure(block_matrix, timer)
+
     #TODO: For inertia correction, figure out if local SC are needed too
     def _form_sc_components(self,
                             timer: HierarchicalTimer
@@ -222,8 +231,8 @@ class MPIASWithOverlapImplicitSchurComplementLinearSolver(MPIASNoOverlapImplicit
             local_sc_dim = border_matrix.num_nonzero_rows
             self.local_schur_complements[ndx] = np.zeros((local_sc_dim, local_sc_dim), dtype=np.double)
 
-            Ar = border_matrix._get_reduced_matrix()
-            self.local_schur_complements[ndx] = Ar @ self.schur_complement @ Ar.T
+            Nk = border_matrix._get_selection_matrix()
+            self.local_schur_complements[ndx] = Nk.T @ self.schur_complement @ Nk
             
             # TODO: Figure out if this is needed, esp. if local regularization is used
             # s_diag = self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo().diagonal()
