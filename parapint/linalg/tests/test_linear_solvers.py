@@ -130,3 +130,8 @@ class TestWrongNonzeroOrdering(unittest.TestCase):
     def test_ma27(self):
         solver = parapint.linalg.InteriorPointMA27Interface()
         self._test_solvers(solver, use_tril=True)
+
+
+if __name__ == '__main__':
+    test_linear_solvers = TestLinearSolvers()
+    test_linear_solvers.test_mumps()

@@ -1,7 +1,7 @@
 from .base_linear_solver_interface import LinearSolverInterface
 from .results import LinearSolverStatus, LinearSolverResults
 from pyomo.common.dependencies import attempt_import
-from scipy.sparse import isspmatrix_coo, tril
+from scipy.sparse import isspmatrix_coo, tril, eye
 from collections import OrderedDict
 import numpy as np
 mumps, mumps_available = attempt_import(name='pyomo.contrib.pynumero.linalg.mumps_interface',
@@ -49,6 +49,7 @@ class MumpsInterface(LinearSolverInterface):
         if not isspmatrix_coo(matrix):
             matrix = matrix.tocoo()
         matrix = tril(matrix)
+        #matrix = tril(matrix + eye(matrix.shape[0]))
         nrows, ncols = matrix.shape
         self._dim = nrows
 
@@ -81,6 +82,7 @@ class MumpsInterface(LinearSolverInterface):
 
         if (not np.array_equal(matrix.row, self._row)) or (not np.array_equal(matrix.col, self._col)):
             self.do_symbolic_factorization(matrix=matrix, raise_on_error=raise_on_error, timer=timer)
+            print("Re-doing symbolic factorization")
 
         try:
             self._mumps.do_numeric_factorization(matrix)
@@ -114,7 +116,7 @@ class MumpsInterface(LinearSolverInterface):
         self._prev_allocation = new_allocation
         return new_allocation
 
-    def do_back_solve(self, rhs):
+    def do_back_solve(self, rhs, timer=None):
         res, status = self._mumps.do_back_solve(rhs)
         self.log_info()
         return res

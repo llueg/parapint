@@ -7,6 +7,7 @@ from numpy.typing import NDArray
 import scipy.sparse.linalg 
 import scipy.sparse as sps
 from scipy.sparse import coo_matrix, csr_matrix
+import ilupp
 from mpi4py import MPI
 import itertools
 from .explicit_schur_complement import _process_sub_results
@@ -20,9 +21,8 @@ comm: MPI.Comm = MPI.COMM_WORLD
 rank: int = comm.Get_rank()
 size: int = comm.Get_size()
 
-
-
-class MPISchurComplementUtilMixin:
+# TODO: I believe this is deprecated
+class MPIDenseSchurComplementUtilMixin:
 
     def __init__(self, subproblem_solvers: Dict[int, LinearSolverInterface]):
         self.subproblem_solvers: Dict[int, LinearSolverInterface] = subproblem_solvers
@@ -31,9 +31,12 @@ class MPISchurComplementUtilMixin:
         self.local_block_indices = list()
         self._local_block_indices_for_numeric_factorization = list()
         self.schur_complement = coo_matrix((0, 0))
-        self._current_schur_complement = coo_matrix((0, 0))
+        #self._current_schur_complement = coo_matrix((0, 0))
         self.border_matrices: Dict[int, _BorderMatrix] = dict()
-        self.sc_data_slices = dict()
+        self.sc_dim = 0
+        self._sc_row = None
+        self._sc_col = None
+        # self.sc_data_slices = dict()
     
     def _get_full_sc_structure(self, block_matrix: MPIBlockMatrix, timer: HierarchicalTimer):
         """
@@ -52,55 +55,70 @@ class MPISchurComplementUtilMixin:
         timer.start('construct_schur_complement')
         sc_nnz = nonzero_rows.size
         sc_dim = block_matrix.get_row_size(self.block_dim - 1)
+        self.sc_dim = sc_dim
+        self._sc_row = nonzero_rows
+        self._sc_col = nonzero_cols
         sc_values = np.zeros(sc_nnz, dtype=np.double)
         self.schur_complement = coo_matrix((sc_values, (nonzero_rows, nonzero_cols)), shape=(sc_dim, sc_dim))
         timer.stop('construct_schur_complement')
-        timer.start('get_sc_data_slices')
-        self.sc_data_slices = dict()
-        for ndx in self.local_block_indices:
-            self.sc_data_slices[ndx] = dict()
-            border_matrix = self.border_matrices[ndx]
-            for row_ndx in border_matrix.nonzero_rows:
-                self.sc_data_slices[ndx][row_ndx] = np.bitwise_and(nonzero_cols == row_ndx, np.isin(nonzero_rows, border_matrix.nonzero_rows)).nonzero()[0]
-        timer.stop('get_sc_data_slices')
+        # timer.start('get_sc_data_slices')
+        # self.sc_data_slices = dict()
+        # for ndx in self.local_block_indices:
+        #     self.sc_data_slices[ndx] = dict()
+        #     border_matrix = self.border_matrices[ndx]
+        #     for row_ndx in border_matrix.nonzero_rows:
+        #         self.sc_data_slices[ndx][row_ndx] = np.bitwise_and(nonzero_cols == row_ndx, np.isin(nonzero_rows, border_matrix.nonzero_rows)).nonzero()[0]
+        # timer.stop('get_sc_data_slices')
 
     def _form_full_sc(self, timer) -> None:
         timer.start('form SC')
-        self.schur_complement.data = np.zeros(self.schur_complement.data.size, dtype=np.double)
+        local_scs = {}
         for ndx in self.local_block_indices:
             border_matrix: _BorderMatrix = self.border_matrices[ndx]
             A = border_matrix.csr
+            Ar = border_matrix._get_reduced_matrix()
             _rhs = np.zeros(A.shape[1], dtype=np.double)
             solver = self.subproblem_solvers[ndx]
-            for row_ndx in border_matrix.nonzero_rows:
+            local_sc_dim = border_matrix.num_nonzero_rows
+            local_sc = np.zeros((local_sc_dim, local_sc_dim), dtype=np.double)
+            for i, row_ndx in enumerate(border_matrix.nonzero_rows):
                 for indptr in range(A.indptr[row_ndx], A.indptr[row_ndx + 1]):
                     col = A.indices[indptr]
                     val = A.data[indptr]
                     _rhs[col] += val
-                timer.start('back solve')
+                timer.start('back_solve')
                 contribution = solver.do_back_solve(_rhs)
-                timer.stop('back solve')
-                timer.start('dot product')
-                contribution = A.dot(contribution)
-                timer.stop('dot product')
-                self.schur_complement.data[self.sc_data_slices[ndx][row_ndx]] -= contribution[border_matrix.nonzero_rows]
+                timer.stop('back_solve')
+                contribution = Ar.dot(contribution)
+                local_sc[i,:] -= contribution
                 for indptr in range(A.indptr[row_ndx], A.indptr[row_ndx + 1]):
                     col = A.indices[indptr]
                     val = A.data[indptr]
                     _rhs[col] -= val
+                
+            local_scs[ndx] = local_sc
 
+        lsc_components = [(local_scs[ndx], self.border_matrices[ndx].nonzero_rows) for ndx in self.local_block_indices]
         timer.start('communicate')
-        sc = np.zeros(self.schur_complement.data.size, dtype=np.double)
-        timer.start('Barrier')
-        comm.Barrier()
-        timer.stop('Barrier')
-        timer.start('Allreduce')
-        comm.Allreduce(self.schur_complement.data, sc)
-        timer.stop('Allreduce')
-        self.schur_complement.data = sc
-        #self.schur_complement = self.schur_complement + self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
-        self._current_schur_complement = self.schur_complement + self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
+        all_components = comm.allreduce(lsc_components)
         timer.stop('communicate')
+        timer.start('assemble_global')
+        sc = np.zeros((self.sc_dim, self.sc_dim), dtype=np.double)
+        #self.sc.data = np.zeros(self.sc.data.size, dtype=np.double)
+        for components in all_components:
+            sc[np.ix_(components[1], components[1])] += components[0]
+        timer.stop('assemble_global')
+
+        timer.start('to_coo')
+        sc = coo_matrix((sc[self._sc_row, self._sc_col], (self._sc_row, self._sc_col)))
+        #sc = coo_matrix(self.sc)
+        timer.stop('to_coo')
+        timer.start('copy')
+        self.schur_complement.data = sc.data
+        #self.schur_complement = self.schur_complement + self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
+        #self._current_schur_complement = self.schur_complement + self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
+        timer.stop('copy')
+
         timer.stop('form SC')
 
     def _symbolic_factorize_diag_blocks(self,
@@ -109,14 +127,14 @@ class MPISchurComplementUtilMixin:
                                         ) -> LinearSolverResults:
         res = LinearSolverResults()
         res.status = LinearSolverStatus.successful
-        timer.start('factorize')
+        timer.start('factorize_diag_blocks')
         for ndx in self.local_block_indices:
             sub_res = self.subproblem_solvers[ndx].do_symbolic_factorization(matrix=block_matrix.get_block(ndx, ndx),
                                                                              raise_on_error=False)
             _process_sub_results(res, sub_res)
             if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
                 break
-        timer.stop('factorize')
+        timer.stop('factorize_diag_blocks')
         res = _gather_results(res)
         return res
 
@@ -128,10 +146,10 @@ class MPISchurComplementUtilMixin:
         res.status = LinearSolverStatus.successful
 
         for ndx in self._local_block_indices_for_numeric_factorization:
-            timer.start('factorize')
+            timer.start('factorize_diag_blocks')
             sub_res = self.subproblem_solvers[ndx].do_numeric_factorization(matrix=block_matrix.get_block(ndx, ndx),
                                                                             raise_on_error=False)
-            timer.stop('factorize')
+            timer.stop('factorize_diag_blocks')
             _process_sub_results(res, sub_res)
             if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
                 break
@@ -152,6 +170,244 @@ class MPISchurComplementUtilMixin:
             _process_sub_results(res, sub_res)
             timer.stop('factor SC')
             return res
+
+
+class MPISchurComplementUtilMixin:
+
+    def __init__(self, subproblem_solvers: Dict[int, LinearSolverInterface]):
+        self.subproblem_solvers: Dict[int, LinearSolverInterface] = subproblem_solvers
+        self.block_dim = 0
+        self.block_matrix: MPIBlockMatrix = None
+        self.local_block_indices = list()
+        self._local_block_indices_for_numeric_factorization = list()
+        self.schur_complement = coo_matrix((0, 0))
+        #self._current_schur_complement = coo_matrix((0, 0))
+        self.border_matrices: Dict[int, _BorderMatrix] = dict()
+        self.sc_data_slices = dict()
+        self.sc_dim: int = 0
+        self.local_var_to_ranks_map = dict()
+        self.neighboring_ranks = []
+        self.neighboring_rank_to_shared_vars = dict()
+        self.global_rank_to_var_map = dict()
+        self.local_comms = dict()
+        self.local_group_ranks = dict()
+        self.all_group_ranks: np.ndarray = None
+        self.ownership_map: np.ndarray = None
+
+    def _get_connectivity_info(self, timer: HierarchicalTimer):
+        
+        timer.start('get_connectivity_info')
+        local_complicating_vars = np.unique(np.concatenate([self.border_matrices[ndx].nonzero_rows for ndx in self.local_block_indices])).ravel()
+        local_var_indicator = np.zeros((self.sc_dim,), dtype=np.bool_)
+        local_var_indicator[local_complicating_vars] = True
+        global_var_indicator_mat = np.zeros((size, self.sc_dim), dtype=np.bool_)
+        timer.start('Allgather')
+        comm.Allgather(local_var_indicator, global_var_indicator_mat)
+        timer.stop('Allgather')
+        ranks_id, var_id= np.nonzero(global_var_indicator_mat)
+        global_rank_to_var_map = dict()
+        for grank in range(size):
+            global_rank_to_var_map[grank] = var_id[ranks_id == grank]
+        self.global_rank_to_var_map = global_rank_to_var_map
+        
+        timer.start('get_local_var_to_ranks_map')
+        local_var_to_ranks_map = dict()
+        neighboring_ranks = []
+        for local_var in list(local_complicating_vars):
+            connected_ranks = ranks_id[var_id == local_var]
+            local_var_to_ranks_map[local_var] = connected_ranks
+            neighboring_ranks.extend(connected_ranks)
+        
+        neighboring_ranks = list(np.unique(np.array(neighboring_ranks)))
+        neighboring_ranks.remove(rank)
+        timer.stop('get_local_var_to_ranks_map')
+        # includes self rank
+        timer.start('get_local_proc_to_shared_vars')
+        local_proc_to_shared_vars = dict()
+        for nrank in neighboring_ranks:
+            local_proc_to_shared_vars[nrank] = np.intersect1d(var_id[ranks_id == nrank], local_complicating_vars)
+        timer.stop('get_local_proc_to_shared_vars')
+
+        self.local_var_to_ranks_map = local_var_to_ranks_map
+        self.neighboring_ranks = neighboring_ranks
+        self.neighboring_rank_to_shared_vars = local_proc_to_shared_vars
+        timer.stop('get_connectivity_info')
+
+        
+        timer.start('get_ownership_map')
+        ownership_map = np.diag(self.block_matrix.rank_ownership)[:-1]
+        assert ownership_map.size == self.block_dim - 1
+        self.ownership_map = ownership_map
+        timer.stop('get_ownership_map')
+
+        timer.start('create_groups')
+        all_neighborring_ranks = comm.allreduce([(rank,neighboring_ranks)], op=MPI.SUM)
+        all_neighborring_ranks = {r[0]: r[1] for r in all_neighborring_ranks}
+        local_groups = {}
+        local_comms = {}
+        rel_local_group_ranks = np.empty(self.block_dim - 1, dtype=np.int64)
+        for ndx in range(self.block_dim - 1):
+            #if ownership_map[ndx] in self.neighboring_ranks:
+            owning_rank = ownership_map[ndx]
+            neighbors = all_neighborring_ranks[owning_rank]
+            local_group_ranks = neighbors + [owning_rank]
+            local_groups[ndx] = comm.group.Incl(local_group_ranks)
+            #local_groups[ndx] = MPI.Group.Incl(local_group_ranks)
+            local_comms[ndx] = comm.Create_group(local_groups[ndx])
+            rel_local_group_ranks[ndx] = local_comms[ndx].Get_rank()
+        # for root_rank, neighbors in all_neighborring_ranks.items():
+        #     if root_rank in neighboring_ranks:
+        #         local_group_ranks = neighbors + [root_rank]
+        #         local_groups[root_rank] = MPI.Group.Incl(local_group_ranks)
+        #         local_comms[root_rank] = comm.Create(local_groups[root_rank])
+        all_group_ranks = np.zeros((size, self.block_dim - 1), dtype=np.int64)
+        comm.Allgather(rel_local_group_ranks, all_group_ranks)
+        self.all_group_ranks = all_group_ranks
+        self.local_comms = local_comms
+        #self.local_group_ranks = local_group_ranks
+        timer.stop('create_groups')
+        
+        # if rank == 0:
+        #     print('global_rank_to_var_map', global_rank_to_var_map)
+        #     print('local_var_to_ranks_map', local_var_to_ranks_map)
+        #     print('neighboring_ranks', neighboring_ranks)
+        #     print('neighboring_rank_to_shared_vars', local_proc_to_shared_vars)
+
+
+
+
+
+        # local_info = [(rank, local_complicating_vars)]
+        # all_info = comm.allgather(local_info)
+        # global_rank_to_var_map = {p[0]: p[1] for p in all_info}
+        # global_var_to_rank_map = dict()
+        # for rank, var_list in global_rank_to_var_map.items():
+        #     for var in var_list:
+        #         if var not in global_var_to_rank_map:
+        #             global_var_to_rank_map[var] = []
+        #         global_var_to_rank_map[var].append(rank)
+
+    def _get_full_sc_structure(self, block_matrix: MPIBlockMatrix, timer: HierarchicalTimer):
+        """
+        Parameters
+        ----------
+        block_matrix: pyomo.contrib.pynumero.sparse.mpi_block_matrix.MPIBlockMatrix
+        """
+        timer.start('build_border_matrices')
+        self.border_matrices = dict()
+        for ndx in self.local_block_indices:
+            self.border_matrices[ndx] = _BorderMatrix(block_matrix.get_block(self.block_dim - 1, ndx))
+        timer.stop('build_border_matrices')
+        timer.start('gather_all_nonzero_elements')
+        nonzero_rows, nonzero_cols = _get_all_nonzero_elements_in_sc_using_ix(self.border_matrices, self.local_block_indices, self.block_dim - 1)
+        timer.stop('gather_all_nonzero_elements')
+        timer.start('construct_schur_complement')
+        sc_nnz = nonzero_rows.size
+        sc_dim = block_matrix.get_row_size(self.block_dim - 1)
+        self.sc_dim = sc_dim
+        sc_values = np.zeros(sc_nnz, dtype=np.double)
+        self.schur_complement = coo_matrix((sc_values, (nonzero_rows, nonzero_cols)), shape=(sc_dim, sc_dim))
+        timer.stop('construct_schur_complement')
+        timer.start('get_sc_data_slices')
+        # TODO: This part can be very slow for problems with many compl. cars per partition
+        #  - however it saves time in iterations later, as sparsity is already computed - can we do this more efficiently (vectorize instead of loop)?
+        self.sc_data_slices = dict()
+        for ndx in self.local_block_indices:
+            self.sc_data_slices[ndx] = dict()
+            border_matrix = self.border_matrices[ndx]
+            for row_ndx in border_matrix.nonzero_rows:
+                self.sc_data_slices[ndx][row_ndx] = np.bitwise_and(nonzero_cols == row_ndx, np.isin(nonzero_rows, border_matrix.nonzero_rows)).nonzero()[0]
+        timer.stop('get_sc_data_slices')
+
+    def _form_full_sc(self, timer) -> None:
+        timer.start('form_SC')
+        self.schur_complement.data = np.zeros(self.schur_complement.data.size, dtype=np.double)
+        for ndx in self.local_block_indices:
+            border_matrix: _BorderMatrix = self.border_matrices[ndx]
+            A = border_matrix.csr
+            _rhs = np.zeros(A.shape[1], dtype=np.double)
+            solver = self.subproblem_solvers[ndx]
+            for row_ndx in border_matrix.nonzero_rows:
+                for indptr in range(A.indptr[row_ndx], A.indptr[row_ndx + 1]):
+                    col = A.indices[indptr]
+                    val = A.data[indptr]
+                    _rhs[col] += val
+                timer.start('back_solve')
+                contribution = solver.do_back_solve(_rhs)
+                timer.stop('back_solve')
+                timer.start('dot_product')
+                contribution = A.dot(contribution)
+                timer.stop('dot_product')
+                self.schur_complement.data[self.sc_data_slices[ndx][row_ndx]] -= contribution[border_matrix.nonzero_rows]
+                for indptr in range(A.indptr[row_ndx], A.indptr[row_ndx + 1]):
+                    col = A.indices[indptr]
+                    val = A.data[indptr]
+                    _rhs[col] -= val
+
+        timer.start('communicate')
+        sc = np.zeros(self.schur_complement.data.size, dtype=np.double)
+        timer.start('Barrier')
+        comm.Barrier()
+        timer.stop('Barrier')
+        timer.start('Allreduce')
+        comm.Allreduce(self.schur_complement.data, sc)
+        timer.stop('Allreduce')
+        self.schur_complement.data = sc
+        #self.schur_complement = self.schur_complement + self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
+        #self._current_schur_complement = self.schur_complement + self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()
+        timer.stop('communicate')
+        timer.stop('form_SC')
+
+    def _symbolic_factorize_diag_blocks(self,
+                                        block_matrix: MPIBlockMatrix,
+                                        timer: HierarchicalTimer
+                                        ) -> LinearSolverResults:
+        res = LinearSolverResults()
+        res.status = LinearSolverStatus.successful
+        timer.start('factorize_diag_blocks')
+        for ndx in self.local_block_indices:
+            sub_res = self.subproblem_solvers[ndx].do_symbolic_factorization(matrix=block_matrix.get_block(ndx, ndx),
+                                                                             raise_on_error=False)
+            _process_sub_results(res, sub_res)
+            if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
+                break
+        timer.stop('factorize_diag_blocks')
+        res = _gather_results(res)
+        return res
+
+    def _numeric_factorize_diag_blocks(self,
+                                       block_matrix: MPIBlockMatrix,
+                                       timer: HierarchicalTimer
+                                       ) -> LinearSolverResults:
+        res = LinearSolverResults()
+        res.status = LinearSolverStatus.successful
+
+        for ndx in self._local_block_indices_for_numeric_factorization:
+            timer.start('factorize_diag_blocks')
+            sub_res = self.subproblem_solvers[ndx].do_numeric_factorization(matrix=block_matrix.get_block(ndx, ndx),
+                                                                            raise_on_error=False)
+            timer.stop('factorize_diag_blocks')
+            _process_sub_results(res, sub_res)
+            if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
+                break
+        res = _gather_results(res)
+        return res
+
+    def _symbolic_numeric_factorize_sc(self,
+                                       sc,
+                                       sc_solver: LinearSolverInterface,
+                                       timer
+                                       ) -> LinearSolverResults:
+            timer.start('factor_SC')
+            res = sc_solver.do_symbolic_factorization(sc, raise_on_error=False)
+            if res.status not in {LinearSolverStatus.successful, LinearSolverStatus.warning}:
+                timer.stop('factor_SC')
+                return res
+            sub_res = sc_solver.do_numeric_factorization(sc)
+            _process_sub_results(res, sub_res)
+            timer.stop('factor_SC')
+            return res
+
 
 class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchurComplementUtilMixin):
     """
@@ -180,7 +436,7 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
         if timer is None:
             timer = HierarchicalTimer()
 
-        block_matrix = matrix
+        self.block_matrix = block_matrix = matrix
         nbrows, nbcols = block_matrix.bshape
         if nbrows != nbcols:
             raise ValueError('The block matrix provided is not square.')
@@ -233,7 +489,7 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
                                  timer: HierarchicalTimer
                                  ) -> LinearSolverResults:
         if self._flag_factorize_sc:
-            res = self._symbolic_numeric_factorize_sc(self._current_schur_complement, self.sc_solver, timer)
+            res = self._symbolic_numeric_factorize_sc(self.schur_complement, self.sc_solver, timer)
         else:
             res = LinearSolverResults()
             res.status = LinearSolverStatus.successful
@@ -313,48 +569,64 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
         """
         if timer is None:
             timer = HierarchicalTimer()
-        
+        timer.start('form_rhs_SC')
         sc_dim = rhs.get_block(self.block_dim - 1).size
         schur_complement_rhs = np.zeros(sc_dim, dtype='d')
         for ndx in self.local_block_indices:
             A = self.block_matrix.get_block(self.block_dim-1, ndx)
             contribution = self.subproblem_solvers[ndx].do_back_solve(rhs.get_block(ndx))
             schur_complement_rhs -= A.tocsr().dot(contribution.flatten())
-        res = np.zeros(sc_dim, dtype='d')
-        comm.Allreduce(schur_complement_rhs, res)
-        schur_complement_rhs = rhs.get_block(self.block_dim - 1) + res
+        #res = np.zeros(sc_dim, dtype='d')
+        #comm.Allreduce(schur_complement_rhs, res)
+        #schur_complement_rhs = rhs.get_block(self.block_dim - 1) + res
+        comm.Allreduce(MPI.IN_PLACE, schur_complement_rhs, op=MPI.SUM)
+        schur_complement_rhs += rhs.get_block(self.block_dim - 1)
 
+        timer.stop('form_rhs_SC')
+
+        def _S(u):
+            timer.start('S_matvec')
+            r = self._sc_matvec(u, timer)
+            timer.stop('S_matvec')
+            return r
+        def _M(r):
+            timer.start('M_matvec')
+            u = self._apply_preconditioner(r, timer)
+            timer.stop('M_matvec')
+            return u
         SC_linop = scipy.sparse.linalg.LinearOperator(shape=(sc_dim, sc_dim),
-                                               matvec=lambda u: self._sc_matvec(u, timer),
+                                               matvec=_S,
                                                dtype='d')
         M_linop = scipy.sparse.linalg.LinearOperator(shape=(sc_dim, sc_dim),
-                                               matvec=lambda r: self._apply_preconditioner(r),
+                                               matvec=_M,
                                                dtype='d')
         
         if self.pcg_options.lbfgs_approx_options.distributed:
             local_var_indices = self.local_var_indices
         else:
             local_var_indices = None
+        timer.start('pcg')
         pcg_sol: PcgSolution = pcg_solve(A=SC_linop,
                                          b=schur_complement_rhs,
                                          M=M_linop,
                                          pcg_options=self.pcg_options,
                                          local_var_indices=local_var_indices)
+        timer.stop('pcg')
         coupling = pcg_sol.x
         self._current_pcg_solution = pcg_sol
         # if rank == 0:
         #     print('# PCG iterations: ', pcg_sol.num_iterations)
         self._update_preconditioner(pcg_sol)
 
-
+        timer.start('local_back_solve')
         result = rhs.copy_structure()
         for ndx in self.local_block_indices:
             A = self.block_matrix.get_block(self.block_dim-1, ndx)
             result.set_block(ndx, self.subproblem_solvers[ndx].do_back_solve(rhs.get_block(ndx) -
                                                                              A.tocsr().transpose().dot(coupling.flatten())))
-
+        timer.stop('local_back_solve')
         result.set_block(self.block_dim-1, coupling)
-
+        
         return result, pcg_sol.status
 
     def get_inertia(self):
@@ -421,23 +693,25 @@ class MPIBaseImplicitSchurComplementLinearSolver(LinearSolverInterface, MPISchur
             y = A.transpose().dot(x)
             timer.stop('dot_product')
             res -= y
-        timer.start('communicate')
-        res_global = np.empty(res.size)
-        comm.Allreduce(res, res_global)
-        timer.stop('communicate')
-        res_global += (self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()).dot(u)
-        return res_global
+        # timer.start('communicate')
+        # res_global = np.empty(res.size)
+        # comm.Allreduce(res, res_global)
+        # timer.stop('communicate')
+        timer.start('communication')
+        comm.Allreduce(MPI.IN_PLACE, res, op=MPI.SUM)
+        timer.stop('communication')
+        #res_global += (self.block_matrix.get_block(self.block_dim-1, self.block_dim-1).tocoo()).dot(u)
+        return res
     
     def _update_preconditioner(self, pcg_sol: PcgSolution):
         raise NotImplementedError('This method should be implemented in a subclass')
     
-    def _apply_preconditioner(self, r: NDArray) -> NDArray:
+    def _apply_preconditioner(self, r: NDArray, timer=None) -> NDArray:
         raise NotImplementedError('This method should be implemented in a subclass')
     
     @property
     def sc_solver(self) -> LinearSolverInterface:
         raise NotImplementedError('This method should be implemented in a subclass')
-    
 
 
 class MPIAdaptiveImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComplementLinearSolver):
@@ -465,7 +739,7 @@ class MPIAdaptiveImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComplem
     @property
     def sc_solver(self) -> LinearSolverInterface:
         return self._sc_solver
-    
+
 
 class MPISpiluImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComplementLinearSolver):
 
@@ -480,13 +754,45 @@ class MPISpiluImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComplement
     def _update_preconditioner(self, pcg_sol: PcgSolution):
         pass
 
-    def _apply_preconditioner(self, r: NDArray) -> NDArray:
+    def _apply_preconditioner(self, r: NDArray, timer=None) -> NDArray:
         return self._spilu_precond.solve(r)
 
+    def _sc_matvec(self, u: NDArray, timer) -> NDArray:
+        return self.schur_complement.dot(u)
+
     def _factorize_sc_components(self, timer: HierarchicalTimer) -> LinearSolverResults:
-        timer.start('SpILU SC')
-        self._spilu_precond = scipy.sparse.linalg.spilu(self._current_schur_complement.tocsc())
-        timer.stop('SpILU SC')
+        timer.start('SpILU_SC')
+        options=dict(IterRefine='SINGLE')
+        self._spilu_precond = scipy.sparse.linalg.spilu(self.schur_complement.tocsc(), options=options)
+        timer.stop('SpILU_SC')
+        res = LinearSolverResults()
+        res.status = LinearSolverStatus.successful
+        return res
+
+
+class MPISpichImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComplementLinearSolver):
+
+    def __init__(self,
+                 subproblem_solvers: Dict[int, LinearSolverInterface],
+                 options: Dict):
+        super().__init__(subproblem_solvers=subproblem_solvers, options=options)
+        self.drop_tol = self.precond_options.get('drop_tol', 1e-4)
+        self.fill_factor = self.precond_options.get('fill_factor', 10)
+        self._flag_form_sc = True
+        self._flag_factorize_sc = False
+        self._spich_precond: scipy.sparse.linalg.LinearOperator = None
+
+    def _update_preconditioner(self, pcg_sol: PcgSolution):
+        pass
+
+    def _apply_preconditioner(self, r: NDArray, timer=None) -> NDArray:
+        return self._spich_precond @ r
+
+    def _factorize_sc_components(self, timer: HierarchicalTimer):
+        timer.start('SpIC SC')
+        A = self.schur_complement.tocsc()
+        self._spich_precond = ilupp.ICholTPreconditioner(A, threshold=self.drop_tol, add_fill_in=int(self.fill_factor * (A.nnz/A.shape[0])))
+        timer.stop('SpIC SC')
         res = LinearSolverResults()
         res.status = LinearSolverStatus.successful
         return res
@@ -504,13 +810,13 @@ class MPILbfgsImplicitSchurComplementLinearSolver(MPIBaseImplicitSchurComplement
     def _update_preconditioner(self, pcg_sol: PcgSolution):
         pass
 
-    def _apply_preconditioner(self, r: NDArray) -> NDArray:
+    def _apply_preconditioner(self, r: NDArray, timer=None) -> NDArray:
         if self._current_pcg_solution is None:
             # No prev solution available
             return r
         else:
             return self._current_pcg_solution.hess_approx.dot(r)
-        
+
 
 #TODO: Somewhat half-baked idea of collecting lbfgs approximations locally and constructing overall approx. with correct sparsity
 # As of now, collects all local variables, not partitioned by local block indices - as this is easier to realize in pcg
@@ -540,11 +846,11 @@ class MPIDistributedLbfgsImplicitSchurComplementLinearSolver(MPIBaseImplicitSchu
             col_idx = np.arange(local_len) # Note: assumes linear ordering
             coo_n = coo_matrix((data, (row_idx, col_idx)), shape=(sc_dim, local_len)).toarray()
             local_v = coo_n.dot(self._current_pcg_solution.hess_approx.dot(coo_n.T.dot(r)))
+            # TODO: Use Allreduce
             global_v = comm.allreduce(local_v)
             return global_v
         else:
             return self._current_pcg_solution.hess_approx.dot(r)
-
 
 
 #TODO: Factory method for different types of implicit schur complement solvers

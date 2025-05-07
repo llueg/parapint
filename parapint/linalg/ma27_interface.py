@@ -153,7 +153,7 @@ class InteriorPointMA27Interface(LinearSolverInterface):
         self._ma27.iw_factor *= factor
         self._ma27.a_factor *= factor
 
-    def do_back_solve(self, rhs):
+    def do_back_solve(self, rhs, timer=None):
         """
         Performs a back solve with the factorized matrix. Should only be called after
         do_numeric_factorization.

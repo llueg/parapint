@@ -35,6 +35,7 @@ class _BorderMatrix(object):
     def __init__(self, matrix):
         self.csr: csr_matrix = matrix.tocsr()
         self.nonzero_rows: np.ndarray = self._get_nonzero_rows()
+        self.selection_matrix: csr_matrix = self._get_selection_matrix()
 
         # maps row index to index in self.nonzero_rows
         self.nonzero_row_to_ndx_map: dict = self._get_nonzero_row_to_ndx_map()
@@ -57,16 +58,22 @@ class _BorderMatrix(object):
     def _get_reduced_matrix(self):
         return self.csr[self.nonzero_rows, :]
     
-    def _get_selection_matrix(self):
+    def _get_selection_matrix(self, format='csr'):
         data = np.ones(self.nonzero_rows.size, dtype=np.int64)
         row_idx = self.nonzero_rows
         col_idx = np.arange(self.nonzero_rows.size) # Note: assumes linear ordering
         coo_n = coo_matrix((data, (row_idx, col_idx)), shape=(self.csr.shape[0], self.nonzero_rows.size))
+        if format == 'coo':
+            return coo_n
         return coo_n.tocsr()
 
     @property
     def num_nonzero_rows(self):
         return self.nonzero_rows.size
+    
+    @property
+    def reduced_matrix(self):
+        return self.csr[self.nonzero_rows, :]
 
 
 def _get_nested_comms() -> List[MPI.Comm]:

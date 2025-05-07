@@ -6,7 +6,7 @@ from parapint.linalg.results import LinearSolverStatus
 from parapint.linalg.iterative.pcg import PcgSolutionStatus
 from parapint.linalg.schur_complement.mpi_implicit_schur_complement import MPIBaseImplicitSchurComplementLinearSolver
 from pyomo.common.timing import HierarchicalTimer
-from parapint.utils import MPIHierarchicalTimer, TimerCollection
+#from parapint.utils import MPIHierarchicalTimer, TimerCollection
 import enum
 from parapint.interfaces.interface import BaseInteriorPointInterface
 from parapint.interfaces.distributed_regularization import MPIDistStochasticSchurComplementInteriorPointInterface, DistStochasticSchurComplementInteriorPointInterface
@@ -16,6 +16,7 @@ from typing import Optional
 from pyomo.common.config import ConfigDict, ConfigValue, PositiveFloat, NonNegativeInt, NonNegativeFloat
 from typing import List, Tuple, Dict
 import pandas as pd
+from mpi4py import MPI
 
 """
 Interface Requirements
@@ -36,7 +37,7 @@ class InteriorPointHistory:
         self._header_fmt = {}
         self._history = {}
         self.logger = logger
-        self.timer: MPIHierarchicalTimer = None
+        self.timer: HierarchicalTimer = None
 
     # def add_iter_data(self, iter:int, **kwargs):
     #     if iter not in self._history:
@@ -237,21 +238,21 @@ def check_convergence(interface, barrier, error_scaling: float, timer=None):
         timer = HierarchicalTimer()
 
     slacks = interface.get_slacks()
-    timer.start('grad obj')
+    timer.start('grad_obj')
     grad_obj = interface.get_obj_factor() * interface.evaluate_grad_objective()
-    timer.stop('grad obj')
-    timer.start('jac eq')
+    timer.stop('grad_obj')
+    timer.start('jac_eq')
     jac_eq = interface.evaluate_jacobian_eq()
-    timer.stop('jac eq')
-    timer.start('jac ineq')
+    timer.stop('jac_eq')
+    timer.start('jac_ineq')
     jac_ineq = interface.evaluate_jacobian_ineq()
-    timer.stop('jac ineq')
-    timer.start('eq cons')
+    timer.stop('jac_ineq')
+    timer.start('eq_cons')
     eq_resid = interface.evaluate_eq_constraints()
-    timer.stop('eq cons')
-    timer.start('ineq cons')
+    timer.stop('eq_cons')
+    timer.start('ineq_cons')
     ineq_resid = interface.evaluate_ineq_constraints() - slacks
-    timer.stop('ineq cons')
+    timer.stop('ineq_cons')
     primals = interface.get_primals()
     duals_eq = interface.get_duals_eq()
     duals_ineq = interface.get_duals_ineq()
@@ -285,7 +286,7 @@ def check_convergence(interface, barrier, error_scaling: float, timer=None):
                        duals_slacks_lb +
                        duals_slacks_ub)
     timer.stop('grad_lag_slacks')
-    timer.start('bound resids')
+    timer.start('bound_resids')
     primals_lb_resid = (primals - primals_lb_mod) * duals_primals_lb - barrier
     primals_ub_resid = (primals_ub_mod - primals) * duals_primals_ub - barrier
     primals_lb_resid[np.isneginf(primals_lb)] = 0
@@ -294,7 +295,7 @@ def check_convergence(interface, barrier, error_scaling: float, timer=None):
     slacks_ub_resid = (ineq_ub_mod - slacks) * duals_slacks_ub - barrier
     slacks_lb_resid[np.isneginf(ineq_lb)] = 0
     slacks_ub_resid[np.isinf(ineq_ub)] = 0
-    timer.stop('bound resids')
+    timer.stop('bound_resids')
 
     if eq_resid.size == 0:
         max_eq_resid = 0
@@ -411,7 +412,7 @@ def numeric_factorization(interface: BaseInteriorPointInterface,
     else:
         if status not in {LinearSolverStatus.successful, LinearSolverStatus.singular}:
             raise RuntimeError('Could not factorize KKT system; linear solver status: ' + str(status))
-
+        timer.start('inertia_check')
         if isinstance(interface, DistStochasticSchurComplementInteriorPointInterface):
             final_inertia_coef = distributed_inertia_check_and_regularization(interface=interface,
                                                                               kkt=kkt,
@@ -431,7 +432,7 @@ def numeric_factorization(interface: BaseInteriorPointInterface,
                                                                     final_inertia_coef=final_inertia_coef,
                                                                     num_realloc=num_realloc,
                                                                     timer=timer)
-
+        timer.stop('inertia_check')
     return final_inertia_coef
 
 
@@ -547,6 +548,7 @@ def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
                                          kkt,
                                          options: IPOptions,
                                          inertia_coef,
+                                         rhs,
                                          timer: Optional[HierarchicalTimer] = None
                                          ):
     if timer is None:
@@ -572,16 +574,16 @@ def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
         logger.debug('{reg_iter:<10}{num_realloc:<10}{reg_coef:<10.2e}'
                      '{pos_eig:<10}{neg_eig:<10}{zero_eig:<10}'
                      '{status:<10}'.format(reg_iter=0, num_realloc=num_realloc, reg_coef=final_inertia_coef,
-                                           pos_eig=None, neg_eig=None, zero_eig=None, status=str(status)))
+                                           pos_eig='None', neg_eig='None', zero_eig='None', status=str(status)))
         if status != LinearSolverStatus.successful:
             raise RuntimeError('Could not factorize KKT system; linear solver status: ' + str(status))
         # do backsolve
-        timer.start('back solve')
+        timer.start('back_solve')
         assert isinstance(options.linalg.solver, MPIBaseImplicitSchurComplementLinearSolver), 'Expected MPIBaseImplicitSchurComplementLinearSolver'
         solver: MPIBaseImplicitSchurComplementLinearSolver = options.linalg.solver
-        delta, pcg_status = solver.do_back_solve(interface.evaluate_primal_dual_kkt_rhs())
+        delta, pcg_status = solver.do_back_solve(rhs, timer=timer)
         num_pcg_iter = solver._current_pcg_solution.num_iterations
-        timer.stop('back solve')
+        timer.stop('back_solve')
     else:
         if status not in {LinearSolverStatus.successful, LinearSolverStatus.singular}:
             raise RuntimeError('Could not factorize KKT system; linear solver status: ' + str(status))
@@ -590,7 +592,13 @@ def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
         _iter = 0
         while final_inertia_coef <= options.inertia_correction.max_coef:
             if status == LinearSolverStatus.successful:
+                # TODO: Adjust timing across ranks, i.e. add explicit barriers between subroutines
+                # curretnly, some ranks 'wait' in inertia check while other are still in factorization/backsolve
+                # could define decorator that adds barrier before and after function call, and defines timer
+                # sub-catrgory to see how much time is spent in barrier for different ranks
+                timer.start('inertia_check')
                 pos_eig, neg_eig, zero_eig = options.linalg.solver.get_inertia()
+                timer.stop('inertia_check')
             else:
                 pos_eig, neg_eig, zero_eig = None, None, None
             logger.debug('{reg_iter:<10}{num_realloc:<10}{reg_coef:<10.2e}'
@@ -604,10 +612,10 @@ def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
                 # do back solve here to check if inertia related error occurs
                 assert isinstance(options.linalg.solver, MPIBaseImplicitSchurComplementLinearSolver), 'Expected MPIBaseImplicitSchurComplementLinearSolver'
                 solver: MPIBaseImplicitSchurComplementLinearSolver = options.linalg.solver
-                timer.start('back solve')
-                delta, pcg_status = solver.do_back_solve(interface.evaluate_primal_dual_kkt_rhs())
+                timer.start('back_solve')
+                delta, pcg_status = solver.do_back_solve(rhs, timer=timer)
                 num_pcg_iter = solver._current_pcg_solution.num_iterations
-                timer.stop('back solve')
+                timer.stop('back_solve')
                 if pcg_status == PcgSolutionStatus.negative_curvature:
                     pass
                 else:
@@ -641,6 +649,7 @@ def numeric_factorization_and_back_solve(interface: BaseInteriorPointInterface,
 
 
 def ip_solve(interface: BaseInteriorPointInterface,
+             comm: MPI.Comm,
              options: Optional[IPOptions] = None,
              timer: Optional[HierarchicalTimer] = None
              ) -> Tuple[InteriorPointStatus, InteriorPointHistory]:
@@ -657,9 +666,12 @@ def ip_solve(interface: BaseInteriorPointInterface,
         options = IPOptions()
 
     if timer is None:
-        timer = MPIHierarchicalTimer()
+        timer = HierarchicalTimer()
 
-    timer.start('IP solve')
+    comm.barrier()
+    t0 = time.time()
+    timer.start('ip_solve')
+    # TODO: could exclude init from ip_solve timer
     timer.start('init')
 
     interface.set_bounds_relaxation_factor(options.bounds_relaxation_factor)
@@ -668,7 +680,6 @@ def ip_solve(interface: BaseInteriorPointInterface,
     inertia_coef = options.inertia_correction.init_coef
     used_inertia_coef = 0
 
-    t0 = time.time()
     primals = interface.init_primals().copy()
     slacks = interface.init_slacks().copy()
     duals_eq = interface.init_duals_eq().copy()
@@ -721,7 +732,7 @@ def ip_solve(interface: BaseInteriorPointInterface,
         aux_logging_data = {}
 
     logging_vars = [('iter', 6, ''), ('objective', 11, '.2e'), ('primal_inf', 11, '.2e'), ('dual_inf', 11, '.2e'), ('compl_inf', 11, '.2e'),
-                    ('barrier', 11, '.2e'), ('alpha_p', 11, '.2e'), ('alpha_d', 11, '.2e'), ('alpha', 11, '.2e'), ('reg', 11, '.2e'), ('time', 7, '.3f')]
+                    ('barrier', 11, '.2e'), ('alpha_p', 11, '.2e'), ('alpha_d', 11, '.2e'), ('alpha', 11, '.2e'), ('reg', 11, '.2e'), ('time', 9, '.2f')]
     
     ip_history = InteriorPointHistory(logger)
     ip_history.log_header(logging_vars + aux_logging_vars)
@@ -740,9 +751,9 @@ def ip_solve(interface: BaseInteriorPointInterface,
         interface.set_duals_slacks_lb(duals_slacks_lb)
         interface.set_duals_slacks_ub(duals_slacks_ub)
 
-        timer.start('convergence check')
+        timer.start('convergence_check')
         primal_inf, dual_inf, complimentarity_inf = check_convergence(interface=interface, barrier=0, error_scaling=options.error_scaling, timer=timer)
-        timer.stop('convergence check')
+        timer.stop('convergence_check')
         objective = interface.evaluate_objective()
         # logger.info('{_iter:<6}'
         #             '{objective:<11.2e}'
@@ -772,12 +783,12 @@ def ip_solve(interface: BaseInteriorPointInterface,
         if max(primal_inf, dual_inf, complimentarity_inf) <= options.tol:
             status = InteriorPointStatus.optimal
             break
-        timer.start('convergence check')
+        timer.start('convergence_check')
         primal_inf, dual_inf, complimentarity_inf = check_convergence(interface=interface,
                                                                       barrier=barrier_parameter,
                                                                       error_scaling=options.error_scaling,
                                                                       timer=timer)
-        timer.stop('convergence check')
+        timer.stop('convergence_check')
         if max(primal_inf, dual_inf, complimentarity_inf) \
                 <= options.barrier_decrease * barrier_parameter:
             barrier_parameter = max(options.minimum_barrier_parameter,
@@ -785,12 +796,12 @@ def ip_solve(interface: BaseInteriorPointInterface,
 
         interface.set_barrier_parameter(barrier_parameter)
         timer.start('eval')
-        timer.start('eval kkt')
+        timer.start('eval_kkt')
         kkt = interface.evaluate_primal_dual_kkt_matrix(timer=timer)
-        timer.stop('eval kkt')
-        timer.start('eval rhs')
+        timer.stop('eval_kkt')
+        timer.start('eval_rhs')
         rhs = interface.evaluate_primal_dual_kkt_rhs(timer=timer)
-        timer.stop('eval rhs')
+        timer.stop('eval_rhs')
         timer.stop('eval')
 
         # Factorize linear system
@@ -814,6 +825,7 @@ def ip_solve(interface: BaseInteriorPointInterface,
                                                                             kkt=kkt,
                                                                             options=options,
                                                                             inertia_coef=inertia_coef,
+                                                                            rhs=rhs,
                                                                             timer=timer)
             aux_logging_data['pcg_iters'] = num_pcg_iter
         else:
@@ -831,17 +843,17 @@ def ip_solve(interface: BaseInteriorPointInterface,
             timer.stop('factorize')
 
             timer.start('back solve')
-            delta = options.linalg.solver.do_back_solve(rhs)
+            delta = options.linalg.solver.do_back_solve(rhs, timer=timer)
             timer.stop('back solve')
 
         interface.set_primal_dual_kkt_solution(delta)
-        timer.start('frac boundary')
+        timer.start('frac_boundary')
         alpha_primal_max, alpha_dual_max = fraction_to_the_boundary(interface=interface, tau=1 - barrier_parameter)
         if options.unified_step:
             tmp = min(alpha_primal_max, alpha_dual_max)
             alpha_primal_max = tmp
             alpha_dual_max = tmp
-        timer.stop('frac boundary')
+        timer.stop('frac_boundary')
 
         delta_primals = interface.get_delta_primals()
         delta_slacks = interface.get_delta_slacks()
@@ -893,7 +905,10 @@ def ip_solve(interface: BaseInteriorPointInterface,
         duals_slacks_lb += alpha * delta_duals_slacks_lb
         duals_slacks_ub += alpha * delta_duals_slacks_ub
 
-    timer.stop('IP solve')
+    timer.start('final_barrier')
+    comm.barrier()
+    timer.stop('final_barrier')
+    timer.stop('ip_solve')
     ip_history.timer = timer
     if options.report_timing:
         print(timer)
