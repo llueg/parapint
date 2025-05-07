@@ -15,7 +15,7 @@ class TimerCollection():
         self._timer_list = timer_list
         self._num_timers: int = len(timer_list)
 
-    def get_total_time(self, identifier) -> Tuple[float, float]:
+    def get_total_time(self, identifier, op='mean-std') -> Tuple[float, float]:
         """
         Parameters
         ----------
@@ -29,7 +29,12 @@ class TimerCollection():
             The total time spent with the specified timer active.
         """
         total_times = np.array([timer.get_total_time(identifier) for timer in self._timer_list])
-        return np.mean(total_times), np.std(total_times)
+        if op == 'mean-std':
+            return np.mean(total_times), np.std(total_times)
+        elif op == 'max-min':
+            return np.max(total_times), np.min(total_times)
+        else:
+            raise NotImplementedError(f"Operation {op} not implemented")
     
     def get_num_calls(self, identifier) -> Tuple[float, float]:
         """
