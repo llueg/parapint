@@ -223,11 +223,13 @@ class MKLPardisoInterface(object):
             'dimension.'
         )
 
-        if self._phase not in [11, 22]:
+        if self._phase not in [11, 22, 33]:
             raise RuntimeError(f'Phase {self._phase} indicates that symbolic factorization has not yet been performed.')
         else:
             if (self._ia != ia).any() or (self._ja != ja).any():
-                raise RuntimeError(f'Sparsity pattern has changed since last symbolic factorization. Please re-run symbolic factorization.')
+                #raise RuntimeError(f'Sparsity pattern has changed since last symbolic factorization. Please re-run symbolic factorization.')
+                print('Warning: Sparsity pattern has changed since last symbolic factorization. Re-running symbolic factorization.')
+                error = self.do_symbolic_factorization(a, ia, ja)
 
         self._phase = 22
         self._a = a

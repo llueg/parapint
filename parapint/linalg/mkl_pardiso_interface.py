@@ -39,7 +39,7 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
         return a2, ia2 + 1, ja2 + 1
 
     def do_symbolic_factorization(
-        self, matrix: Union[spmatrix, BlockMatrix], raise_on_error: bool = True
+        self, matrix: Union[spmatrix, BlockMatrix], raise_on_error: bool = True, timer = None
     ) -> LinearSolverResults:
         self._num_status = None
         nrows, ncols = matrix.shape
@@ -70,7 +70,7 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
 
 
     def do_numeric_factorization(
-        self, matrix: Union[spmatrix, BlockMatrix], raise_on_error: bool = True
+        self, matrix: Union[spmatrix, BlockMatrix], raise_on_error: bool = True, timer = None
     ) -> LinearSolverResults:
         nrows, ncols = matrix.shape
         if nrows != ncols:
@@ -108,7 +108,7 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
         raise NotImplementedError("increase_memory_allocation not implemented for MKL Pardiso")
 
     def do_back_solve(
-        self, rhs: Union[np.ndarray, BlockVector], raise_on_error: bool = True
+        self, rhs: Union[np.ndarray, BlockVector], raise_on_error: bool = True, timer = None
     ) -> Union[np.ndarray, BlockVector]:
         if self._num_status is None:
             raise RuntimeError('Must call do_numeric_factorization before do_back_solve can be called')
