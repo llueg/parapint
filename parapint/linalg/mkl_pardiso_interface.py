@@ -10,7 +10,7 @@ import numpy as np
 
 
 class InteriorPointMKLPardisoInterface(LinearSolverInterface):
-    def __init__(self, iparm=None, msglvl: int = 0):
+    def __init__(self, iparm=None, msglvl: int = 0, nrhs: int = 1):
         self._pardiso = MKLPardisoInterface()
         if iparm is not None:
             for k, v in iparm.items():
@@ -18,6 +18,7 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
         self._dim = None
         self._num_status = None
         self._pardiso.set_msglvl(msglvl)
+        self._pardiso.set_nrhs(nrhs)
 
     @classmethod
     def getLoggerName(cls):
@@ -66,8 +67,6 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
             else:
                 res.status = LinearSolverStatus.error
         return res
-    
-
 
     def do_numeric_factorization(
         self, matrix: Union[spmatrix, BlockMatrix], raise_on_error: bool = True, timer = None
@@ -101,9 +100,7 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
         self._num_status = res.status
 
         return res
-    
 
-    
     def increase_memory_allocation(self, factor):
         raise NotImplementedError("increase_memory_allocation not implemented for MKL Pardiso")
 
@@ -132,6 +129,9 @@ class InteriorPointMKLPardisoInterface(LinearSolverInterface):
 
     def set_iparm(self, key, value):
         self._pardiso.set_iparm(key, value)
+
+    def set_nrhs(self, nrhs):
+        self._pardiso.set_nrhs(nrhs)
 
     def get_iparm(self, key):
         return self._pardiso.get_iparm(key)

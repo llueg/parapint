@@ -144,6 +144,12 @@ class MKLPardisoInterface(object):
             raise ValueError('msglvl must be 0 or 1.')
         self._msglvl = val
 
+    def set_nrhs(self, val):
+        validate_value(val, int)
+        if val < 1:
+            raise ValueError('nrhs must be greater than or equal to 1.')
+        self._nrhs = val
+
     def _set_iparm_default(self):
         iparm = self._default_iparm.copy()
         iparm[9] = 13
@@ -241,10 +247,16 @@ class MKLPardisoInterface(object):
 
     def do_backsolve(self, rhs, copy=True):
         rhs = rhs.astype(np.double, casting='safe', copy=copy)
-        dim = rhs.size
-        assert (
-            dim == self._dim
-        ), 'Dimension mismatch in right hand side. Please correct.'
+
+        if self._nrhs > 1:
+            assert rhs.size == self._dim * self._nrhs, 'Dimension mismatch in right hand side. Please correct.'
+            assert rhs.shape[0] == self._nrhs, 'Right hand side must be a 2D array with shape (nrhs, dim).'
+            rhs = rhs.flatten()
+        else:
+            dim = rhs.size
+            assert (
+                dim == self._dim
+            ), 'Dimension mismatch in right hand side. Please correct.'
 
         if self._phase not in [22, 33]:
             raise RuntimeError(f'Phase {self._phase} indicates that numeric factorization has not yet been performed.')
@@ -252,11 +264,15 @@ class MKLPardisoInterface(object):
         self._phase = 33
         self._b = rhs
         self._x = np.zeros_like(self._b)
+
         self._set_iparm_default()
         self._call_pardiso()
 
-        return self._x
-    
+        if self._nrhs > 1:
+            return self._x.reshape(self._nrhs, self._dim)
+        else:
+            return self._x
+
 
     def do_symbolic_factorization_schur(self, a, ia, ja, dim_schur):
         # Assumes Schur Complement in lower right quadrant

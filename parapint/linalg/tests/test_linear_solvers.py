@@ -107,6 +107,30 @@ class TestLinearSolvers(unittest.TestCase):
         x = solver.do_back_solve(rhs)
         self.assertTrue(np.allclose(x, x_true))
 
+
+    def _test_linear_solvers_multiple_rhs(self, solver):
+        mat = get_base_matrix(use_tril=False)
+        # Note: As of now, MKL Pardiso needs filled matrix even for symbolic factorization,
+        # as zero diagonal elements are not allowed.
+        # Also, MKL Pardiso need triu not tril - for now just disabling it
+        #zero_mat = mat.copy()
+        #zero_mat.data.fill(0)
+        solver.set_nrhs(4)
+        stat = solver.do_symbolic_factorization(mat)
+        self.assertEqual(stat.status, parapint.linalg.LinearSolverStatus.successful)
+        stat = solver.do_numeric_factorization(mat)
+        self.assertEqual(stat.status, parapint.linalg.LinearSolverStatus.successful)
+        x_true_1 = np.array([1, 2, 3], dtype=np.double)
+        x_true_2 = np.array([4, 2, 3], dtype=np.double)
+        x_true_3 = np.array([5, 6, 7], dtype=np.double)
+        x_true_4 = np.array([8, 9, 10], dtype=np.double)
+        x_true = np.row_stack((x_true_1, x_true_2, x_true_3, x_true_4))
+        rhs = (mat @ x_true.T).T
+        x = solver.do_back_solve(rhs)
+        #print(f'shape of x: {x.shape}')
+        #print(f'shape of x_true: {x_true.shape}')
+        self.assertTrue(np.allclose(x, x_true))
+
     def _test_inertia_computation(self, solver):
         mat = get_base_matrix(use_tril=False)
         #zero_mat = mat.copy()
@@ -151,6 +175,7 @@ class TestLinearSolvers(unittest.TestCase):
         solver = parapint.linalg.InteriorPointMKLPardisoInterface()
         self._test_linear_solvers(solver)
         self._test_inertia_computation(solver)
+        self._test_linear_solvers_multiple_rhs(solver)
 
 @unittest.skip('This does not work yet')
 class TestWrongNonzeroOrdering(unittest.TestCase):
@@ -214,6 +239,7 @@ class TestSchurComplementSolver(unittest.TestCase):
     def test_mkl_pardiso(self):
         solver = parapint.linalg.InteriorPointMKLPardisoSchurInterface()
         self._test_schur_solvers(solver)
+
 
 
 if __name__ == '__main__':
